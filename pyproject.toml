@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ask-to-mask"
+version = "0.1.0"
+description = "Generate organelle segmentation masks from EM images using Flux image editing"
+license = { text = "BSD-3-Clause" }
+requires-python = ">=3.12"
+dependencies = [
+    "diffusers>=0.32.0",
+    "transformers",
+    "accelerate",
+    "safetensors",
+    "Pillow",
+    "numpy",
+    "scikit-image",
+    "tqdm",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ask_to_mask"]

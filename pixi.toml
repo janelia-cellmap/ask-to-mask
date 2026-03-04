@@ -1,0 +1,17 @@
+[project]
+name = "ask-to-mask"
+version = "0.1.0"
+description = "Generate organelle segmentation masks from EM images using Flux image editing"
+channels = ["conda-forge", "pytorch", "nvidia"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = "3.12.*"
+pip = "*"
+
+[pypi-dependencies]
+ask-to-mask = { path = ".", editable = true }
+
+[tasks]
+install-torch-cu126 = "pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126"
+segment = "python -m ask_to_mask.cli"
