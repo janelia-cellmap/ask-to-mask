@@ -132,19 +132,20 @@ def segment_single(
     # Crop result back to original aspect ratio (undo padding)
     result_cropped = unpad(result, crop_box, TARGET_SIZE)
 
-    # Build filename prefix: {image}_{model}_{organelle}
-    prefix = f"{image_path.stem}_{model_key}_{organelle.key}"
+    # Organize outputs into subdirectories: output_dir/image_stem/model_key/
+    sub_dir = output_dir / image_path.stem / model_key
+    sub_dir.mkdir(parents=True, exist_ok=True)
 
     # Optionally save the colored intermediate and overlay at original size
     if save_colored:
         colored_out = result_cropped.resize(original_size, Image.LANCZOS)
         suffix = "instance_colored" if instance else "colored"
-        colored_path = output_dir / f"{prefix}_{suffix}.png"
+        colored_path = sub_dir / f"{organelle.key}_{suffix}.png"
         colored_out.save(colored_path)
 
         # Save overlay: colored output blended on top of raw EM image
         overlay = overlay_on_raw(img, colored_out)
-        overlay_path = output_dir / f"{prefix}_overlay.png"
+        overlay_path = sub_dir / f"{organelle.key}_overlay.png"
         overlay.save(overlay_path)
 
     # Extract mask at cropped inference resolution, then resize to original
@@ -157,12 +158,12 @@ def segment_single(
         )
         mask_img = Image.fromarray(mask)
         mask_img = mask_img.resize(original_size, Image.NEAREST)
-        mask_path = output_dir / f"{prefix}_instances.png"
+        mask_path = sub_dir / f"{organelle.key}_instances.png"
     else:
         mask = extract_mask(img_resized_cropped, result_cropped, organelle.rgb, threshold=threshold)
         mask_img = Image.fromarray(mask, mode="L")
         mask_img = mask_img.resize(original_size, Image.NEAREST)
-        mask_path = output_dir / f"{prefix}_mask.png"
+        mask_path = sub_dir / f"{organelle.key}_mask.png"
 
     mask_img.save(mask_path)
     return mask_path

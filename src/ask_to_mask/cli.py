@@ -79,6 +79,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Include EM-specific organelle descriptions in the prompt.",
     )
     seg.add_argument("--device", default="cuda", help="Torch device (default: cuda).")
+    seg.add_argument(
+        "--lora",
+        type=str,
+        default=None,
+        help="Path to LoRA weights directory or HuggingFace repo ID.",
+    )
+
+    # --- train ---
+    train_parser = sub.add_parser("train", help="Fine-tune Flux with LoRA on CellMap data.")
+    train_parser.add_argument(
+        "--config", type=Path, required=True, help="Training config YAML."
+    )
+    train_parser.add_argument(
+        "--resume", type=str, default=None, help="Resume from checkpoint directory."
+    )
 
     # --- list-organelles ---
     sub.add_parser("list-organelles", help="List available organelle classes.")
@@ -99,7 +114,7 @@ def cmd_segment(args: argparse.Namespace) -> None:
     from .pipeline import segment
 
     print(f"Loading model: {args.model} ({MODELS[args.model]})")
-    pipe = load_pipeline(args.model, device=args.device)
+    pipe = load_pipeline(args.model, device=args.device, lora_weights=args.lora)
 
     # Collect image paths
     if args.input:
@@ -137,6 +152,12 @@ def cmd_segment(args: argparse.Namespace) -> None:
     print("\nDone.")
 
 
+def cmd_train(args: argparse.Namespace) -> None:
+    from .training.train import train
+
+    train(config_path=str(args.config), resume_from=args.resume)
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
 
@@ -144,6 +165,8 @@ def main(argv: list[str] | None = None) -> None:
         cmd_list_organelles()
     elif args.command == "segment":
         cmd_segment(args)
+    elif args.command == "train":
+        cmd_train(args)
 
 
 if __name__ == "__main__":

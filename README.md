@@ -1,6 +1,6 @@
 # ask-to-mask
 
-Generate organelle segmentation masks from electron microscopy (EM) images using Flux image editing models.
+Generate organelle segmentation masks from EM images using Flux image editing models.
 
 The idea: send an EM image to a Flux model with a prompt like *"Color all the mitochondria in bright red"*, then extract a binary segmentation mask from the color difference between the original and edited images.
 
@@ -51,11 +51,20 @@ Output is a uint16 PNG where each pixel value is an instance ID (0 = background)
 pixi run segment list-organelles
 ```
 
+### Use LoRA weights
+
+Run inference with finetuned LoRA weights:
+
+```bash
+pixi run segment segment --input image.png --output-dir ./masks/ --organelles mito --lora checkpoints/flux-kontext-lora --save-colored
+```
+
 ### Key options
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--model` | `kontext-dev` | Flux model (`kontext-dev` or `flux2-dev`) |
+| `--lora` | None | Path to LoRA weights directory |
 | `--resolution` | None | Image resolution in nm/pixel for enhanced prompts |
 | `--num-steps` | `28` | Number of inference steps |
 | `--guidance-scale` | `3.5` | How strongly to follow the prompt |
@@ -91,13 +100,52 @@ Each organelle is assigned a distinct high-contrast color for clean mask extract
 | `heterochromatin` | Heterochromatin | Spring green | 100-5000 nm |
 | `euchromatin` | Euchromatin | Rose | 100-10000 nm |
 
+## LoRA finetuning
+
+Finetune Flux on annotated CellMap EM data to improve organelle recognition.
+
+### Setup
+
+```bash
+pixi run install-train-deps
+```
+
+### Train
+
+```bash
+pixi run train --config configs/train_lora.yaml
+```
+
+Edit `configs/train_lora.yaml` to configure:
+- `model.pretrained`: which Flux model to finetune (`FLUX.1-Kontext-dev` or `FLUX.2-dev`)
+- `model.lora.rank`: LoRA rank (default 16)
+- `data.organelles`: which organelles to train on
+- `data.data_root`: path to CellMap zarr data
+- `training.max_train_steps`: number of training steps
+- `training.output_dir`: where to save LoRA weights
+
+Training data is read directly from CellMap zarr volumes. The dataset creates (EM slice, colored EM slice, prompt) triplets by coloring annotated organelle regions with the organelle's designated color.
+
+Checkpoints are saved periodically and can be used for inference with `--lora`.
+
+### Hardware
+
+Requires A100 80GB or equivalent. Uses gradient checkpointing and 8-bit Adam to fit in memory.
+
 ## Project structure
 
 ```
 src/ask_to_mask/
-  cli.py           # CLI entry point (segment, list-organelles)
+  cli.py           # CLI entry point (segment, list-organelles, train)
   config.py        # Organelle class definitions and model registry
-  model.py         # Flux model loading and inference
+  model.py         # Flux model loading and inference (with LoRA support)
   pipeline.py      # Orchestrates load → prompt → infer → postprocess
   postprocess.py   # Mask extraction (semantic + instance)
+  training/
+    dataset.py     # CellMapFluxDataset: zarr-backed training data
+    zarr_utils.py  # Zarr reading utilities (adapted from sam3m)
+    train.py       # LoRA training loop with accelerate + PEFT
+configs/
+  train_lora.yaml  # Training configuration
+  norms.csv        # Per-dataset intensity normalization
 ```

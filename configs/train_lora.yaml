@@ -1,0 +1,55 @@
+# ask-to-mask LoRA finetuning config
+
+model:
+  pretrained: "black-forest-labs/FLUX.1-Kontext-dev"
+  lora:
+    rank: 16
+    alpha: 16
+    dropout: 0.0
+    # null = use defaults (all attention + FF layers)
+    target_modules: null
+
+data:
+  data_root: /nrs/cellmap/data
+  norms_csv: configs/norms.csv
+  organelles:
+    - mito
+    - er
+    - nucleus
+    - lipid_droplet
+    - plasma_membrane
+    - nuclear_envelope
+  samples_per_epoch: 16
+  min_mask_fraction: 0.01  # skip slices where organelle covers < 1%
+  cache_dir: configs
+  skip_datasets: []
+  # include_datasets: null  # null = all datasets
+
+training:
+  batch_size: 16
+  gradient_accumulation_steps: 4
+  learning_rate: 1.0e-4
+  lr_scheduler: constant
+  lr_warmup_steps: 200
+  max_train_steps: 5000
+  mixed_precision: bf16
+  gradient_checkpointing: true
+  seed: 42
+  guidance_scale: 3.5
+
+  # Loss weighting: "sigma_sqrt" or "none"
+  weighting_scheme: sigma_sqrt
+
+  # Validation and checkpointing
+  validation_steps: 100
+  train_image_log_steps: none  # how often to log training input/target images
+  checkpointing_steps: 500
+
+  # Output
+  output_dir: runs/flux-kontext-lora
+
+  # Optimizer
+  use_8bit_adam: true
+
+logging:
+  report_to: tensorboard

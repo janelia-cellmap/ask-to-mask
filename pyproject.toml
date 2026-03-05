@@ -19,5 +19,15 @@ dependencies = [
     "tqdm",
 ]
 
+[project.optional-dependencies]
+train = [
+    "peft>=0.7.0",
+    "zarr",
+    "scipy",
+    "pyyaml",
+    "tensorboard",
+    "bitsandbytes",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/ask_to_mask"]
