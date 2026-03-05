@@ -8,12 +8,15 @@ from PIL import Image
 from .config import MODELS
 
 
-def load_pipeline(model_key: str, device: str = "cuda"):
-    """Load a Flux pipeline by model key.
+def load_pipeline(
+    model_key: str, device: str = "cuda", lora_weights: str | None = None
+):
+    """Load a Flux pipeline by model key, optionally with LoRA weights.
 
     Args:
         model_key: Key from config.MODELS (e.g., "kontext-dev", "flux2-dev").
         device: Torch device string.
+        lora_weights: Path to LoRA weights directory or HuggingFace repo ID.
 
     Returns:
         A diffusers pipeline ready for inference.
@@ -38,6 +41,9 @@ def load_pipeline(model_key: str, device: str = "cuda"):
         pipe = FluxImg2ImgPipeline.from_pretrained(
             model_id, torch_dtype=torch.bfloat16
         )
+
+    if lora_weights is not None:
+        pipe.load_lora_weights(lora_weights)
 
     pipe.to(device)
     return pipe

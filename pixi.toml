@@ -8,10 +8,13 @@ platforms = ["linux-64"]
 [dependencies]
 python = "3.12.*"
 pip = "*"
+setuptools = ">=70,<81"
 
 [pypi-dependencies]
 ask-to-mask = { path = ".", editable = true }
 
 [tasks]
 install-torch-cu126 = "pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126"
+install-train-deps = "pip install -e '.[train]'"
 segment = "python -m ask_to_mask.cli"
+train = "python -m ask_to_mask.cli train"

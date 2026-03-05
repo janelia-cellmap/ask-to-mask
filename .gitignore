@@ -2,6 +2,11 @@
 out/
 examples/
 
+# Training runs, checkpoints, and config caches
+runs/
+checkpoints/
+configs/*.pkl
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

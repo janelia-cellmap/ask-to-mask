@@ -20,7 +20,7 @@ class OrganelleClass:
 
     def _build_context(self, detailed: bool = False) -> list[str]:
         """Build context parts: EM preamble and optional description."""
-        parts = ["This is an electron microscopy (EM) image."]
+        parts = ["This is an EM image of cell(s)."]
         if detailed and self.description:
             parts.append(f"In EM, {self.name} appear as: {self.description}")
         return parts
@@ -170,6 +170,21 @@ ORGANELLES: dict[str, OrganelleClass] = {
         ),
         # approx_size_nm=(100, 10000),
     ),
+}
+
+# Mapping from ask-to-mask organelle keys to CellMap zarr fine-class directory names.
+# Used by the training dataset to union fine-class labels into organelle-level masks.
+ORGANELLE_FINE_CLASSES: dict[str, list[str]] = {
+    "mito": ["mito_mem", "mito_lum", "mito_ribo"],
+    "er": ["er_mem", "er_lum", "eres_mem", "eres_lum"],
+    "nucleus": ["ne_mem", "ne_lum", "np_out", "np_in", "hchrom", "echrom", "nucpl"],
+    "lipid_droplet": ["ld_mem", "ld_lum"],
+    "plasma_membrane": ["pm"],
+    "nuclear_envelope": ["ne_mem", "ne_lum"],
+    "nuclear_pore": ["np_out", "np_in"],
+    "nucleolus": [],
+    "heterochromatin": ["hchrom"],
+    "euchromatin": ["echrom"],
 }
 
 # Supported Flux model identifiers
