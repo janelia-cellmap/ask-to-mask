@@ -131,8 +131,6 @@ def normalize_raw(raw: np.ndarray, norm: NormParams) -> np.ndarray:
         denom = 1.0
     raw = (raw - norm.min_val) / denom
     np.clip(raw, 0.0, 1.0, out=raw)
-    if norm.inverted:
-        raw = 1.0 - raw
     return raw
 
 
@@ -348,3 +346,83 @@ def discover_crops(
         logger.info(f"Saved crop cache to {cache_path}")
 
     return crops
+
+
+def compute_auto_norms(
+    crops: list[CropInfo],
+    percentile_low: float = 1.0,
+    percentile_high: float = 99.0,
+    num_slices: int = 5,
+) -> dict[str, NormParams]:
+    """Compute percentile-based normalization params per dataset.
+
+    Samples up to num_slices middle Z-slices across crops per dataset,
+    then uses percentile clipping to determine min/max.
+    """
+    import zarr as zarr_mod
+
+    by_dataset: dict[str, list[CropInfo]] = {}
+    for c in crops:
+        by_dataset.setdefault(c.dataset_name, []).append(c)
+
+    auto_norms: dict[str, NormParams] = {}
+    for dataset_name in sorted(by_dataset):
+        ds_crops = by_dataset[dataset_name]
+        indices = np.linspace(
+            0, len(ds_crops) - 1, min(num_slices, len(ds_crops)), dtype=int
+        )
+        all_vals = []
+        for i in indices:
+            crop = ds_crops[i]
+            try:
+                raw_arr = zarr_mod.open(
+                    os.path.join(crop.raw_zarr_path, crop.raw_scale_path), mode="r"
+                )
+            except Exception:
+                continue
+
+            raw_off = np.array(crop.raw_offset_world)
+            raw_res = np.array(crop.raw_resolution)
+            raw_shape = np.array(crop.raw_shape)
+            crop_origin = np.array(crop.crop_origin_world)
+            crop_extent = np.array(crop.crop_extent_world)
+
+            z_extent_vox = int(crop_extent[0] / raw_res[0])
+            if z_extent_vox < 1:
+                continue
+            z_mid = z_extent_vox // 2
+            z_world = crop_origin[0] + z_mid * raw_res[0]
+            z_vox = int(round((z_world - raw_off[0]) / raw_res[0]))
+            z_vox = max(0, min(z_vox, raw_shape[0] - 1))
+
+            y_start = int(round((crop_origin[1] - raw_off[1]) / raw_res[1]))
+            x_start = int(round((crop_origin[2] - raw_off[2]) / raw_res[2]))
+            y_size = int(round(crop_extent[1] / raw_res[1]))
+            x_size = int(round(crop_extent[2] / raw_res[2]))
+            y_start = max(0, min(y_start, raw_shape[1] - 1))
+            x_start = max(0, min(x_start, raw_shape[2] - 1))
+            y_end = min(y_start + y_size, raw_shape[1])
+            x_end = min(x_start + x_size, raw_shape[2])
+
+            raw_2d = np.array(raw_arr[z_vox, y_start:y_end, x_start:x_end])
+            if raw_2d.size > 500_000:
+                step = max(1, int(np.sqrt(raw_2d.size / 500_000)))
+                raw_2d = raw_2d[::step, ::step]
+            all_vals.append(raw_2d.ravel())
+
+        if not all_vals:
+            auto_norms[dataset_name] = NormParams(0.0, 255.0, False)
+            continue
+
+        combined = np.concatenate(all_vals)
+        p_low = float(np.percentile(combined, percentile_low))
+        p_high = float(np.percentile(combined, percentile_high))
+
+        auto_norms[dataset_name] = NormParams(
+            min_val=round(p_low, 1),
+            max_val=round(p_high, 1),
+            inverted=False,
+        )
+        logger.info(f"  auto-norm {dataset_name}: [{p_low:.1f}, {p_high:.1f}]")
+
+    return auto_norms
