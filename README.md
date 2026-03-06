@@ -186,6 +186,7 @@ scripts/
 configs/
   train_lora.yaml                  # Kontext training configuration
   train_lora_flux2.yaml            # Flux2-dev training configuration
-  train_lora_flux2_r64_autonorm.yaml # Flux2-dev with auto-norms, rank 64
-  norms.csv                        # Per-dataset intensity normalization (manual)
+  train_lora_flux2_r64_autonorm.yaml           # Flux2-dev with auto-norms, rank 64
+  train_lora_flux2_r64_autonorm_augmented.yaml # Flux2-dev with auto-norms + all augmentations
+  norms.csv                                    # Per-dataset intensity normalization (manual)
 ```

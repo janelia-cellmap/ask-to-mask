@@ -145,7 +145,7 @@ class CellMapFluxDataset(Dataset):
         self._crop_organelles: dict[str, list[str]] = {}
         for key, crops_list in self.organelle_crops.items():
             for c in crops_list:
-                crop_id = f"{c.dataset_name}:{c.crop_name}"
+                crop_id = f"{c.dataset_name}:{c.crop_id}"
                 self._crop_organelles.setdefault(crop_id, []).append(key)
 
         # Class-balanced sampling state
@@ -260,7 +260,7 @@ class CellMapFluxDataset(Dataset):
 
             # Maybe add more organelles from the same crop
             if self.multi_organelle_prob > 0 and self.rng.random() < self.multi_organelle_prob:
-                crop_id = f"{crop.dataset_name}:{crop.crop_name}"
+                crop_id = f"{crop.dataset_name}:{crop.crop_id}"
                 available = [
                     k for k in self._crop_organelles.get(crop_id, [])
                     if k != organelle_key
