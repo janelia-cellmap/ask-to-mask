@@ -18,25 +18,33 @@ class OrganelleClass:
         "to distinguish separate instances. Keep everything else unchanged."
     )
 
-    def _build_context(self, detailed: bool = False) -> list[str]:
-        """Build context parts: EM preamble and optional description."""
+    def _build_context(
+        self, detailed: bool = False, resolution_nm: float | None = None,
+    ) -> list[str]:
+        """Build context parts: EM preamble and optional description/resolution."""
         parts = ["This is an EM image of cell(s)."]
+        if resolution_nm is not None:
+            parts.append(f"The image resolution is {resolution_nm:.0f}nm/px.")
         if detailed and self.description:
             parts.append(f"In EM, {self.name} appear as: {self.description}")
         return parts
 
-    def build_prompt(self, detailed: bool = False) -> str:
+    def build_prompt(
+        self, detailed: bool = False, resolution_nm: float | None = None,
+    ) -> str:
         """Build a semantic segmentation prompt, optionally with EM description."""
-        parts = self._build_context(detailed)
+        parts = self._build_context(detailed, resolution_nm=resolution_nm)
         parts.append(
             f"Color all the {self.name} in {self.color_name}. "
             f"Keep everything else unchanged."
         )
         return " ".join(parts)
 
-    def build_instance_prompt(self, detailed: bool = False) -> str:
+    def build_instance_prompt(
+        self, detailed: bool = False, resolution_nm: float | None = None,
+    ) -> str:
         """Build an instance segmentation prompt, optionally with EM description."""
-        parts = self._build_context(detailed)
+        parts = self._build_context(detailed, resolution_nm=resolution_nm)
         parts.append(
             f"Color each individual {self.name} a different unique bright color "
             f"to distinguish separate instances. Keep everything else unchanged."
