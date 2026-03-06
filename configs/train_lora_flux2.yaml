@@ -1,0 +1,62 @@
+# ask-to-mask LoRA finetuning config — Flux2-dev
+
+model:
+  pretrained: "black-forest-labs/FLUX.2-dev"
+  lora:
+    rank: 16
+    alpha: 16
+    dropout: 0.0
+    # null = use defaults (all attention + FF layers)
+    target_modules: null
+
+data:
+  data_root: /nrs/cellmap/data
+  norms_csv: configs/norms.csv
+  organelles:
+    - mito
+    - er
+    - nucleus
+    - lipid_droplet
+    - plasma_membrane
+    - nuclear_envelope
+  samples_per_epoch: 4
+  min_mask_fraction: 0.01  # skip slices where organelle covers < 1%
+  cache_dir: configs
+  skip_datasets: []
+  # "overlay" = EM + colored organelles, "segmentation" = colored mask on black
+  target_mode: segmentation
+
+training:
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  learning_rate: 1.0e-4
+  lr_scheduler: constant
+  lr_warmup_steps: 200
+  max_train_steps: 5000
+  mixed_precision: bf16
+  gradient_checkpointing: true
+  seed: 42
+  guidance_scale: 3.5
+
+  # Loss weighting: "sigma_sqrt" or "none"
+  weighting_scheme: sigma_sqrt
+
+  # Flux2 conditioning: "noise_endpoint" or "concatenate"
+  flux2_conditioning: noise_endpoint
+  # Blend between EM latents (0) and pure noise (1) for noise_endpoint mode
+  # 0 = pure EM→target flow (cleanest), >0 adds noise for robustness
+  flux2_noise_mix: 0.0
+
+  # Validation and checkpointing
+  validation_steps: 100
+  train_image_log_steps: none
+  checkpointing_steps: 500
+
+  # Output
+  output_dir: runs/flux2-dev-lora
+
+  # Optimizer
+  use_8bit_adam: true
+
+logging:
+  report_to: tensorboard

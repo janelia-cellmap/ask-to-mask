@@ -113,20 +113,52 @@ pixi run install-train-deps
 ### Train
 
 ```bash
+# Kontext model (image editing approach)
 pixi run train --config configs/train_lora.yaml
+
+# Flux2-dev model (img2img approach)
+pixi run train --config configs/train_lora_flux2.yaml
+
+# Flux2-dev with auto-computed intensity normalization
+pixi run train --config configs/train_lora_flux2_r64_autonorm.yaml
 ```
 
-Edit `configs/train_lora.yaml` to configure:
-- `model.pretrained`: which Flux model to finetune (`FLUX.1-Kontext-dev` or `FLUX.2-dev`)
-- `model.lora.rank`: LoRA rank (default 16)
-- `data.organelles`: which organelles to train on
-- `data.data_root`: path to CellMap zarr data
-- `training.max_train_steps`: number of training steps
-- `training.output_dir`: where to save LoRA weights
-
-Training data is read directly from CellMap zarr volumes. The dataset creates (EM slice, colored EM slice, prompt) triplets by coloring annotated organelle regions with the organelle's designated color.
+Training data is read directly from CellMap zarr volumes. The dataset creates (EM slice, target image, prompt) triplets by coloring annotated organelle regions.
 
 Checkpoints are saved periodically and can be used for inference with `--lora`.
+
+### Training config options
+
+Edit `configs/train_lora.yaml` (Kontext) or `configs/train_lora_flux2.yaml` (Flux2) to configure:
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `model.pretrained` | varies | Flux model to finetune (`FLUX.1-Kontext-dev` or `FLUX.2-dev`) |
+| `model.lora.rank` | `16` | LoRA rank |
+| `data.organelles` | all | Which organelles to train on |
+| `data.data_root` | `/nrs/cellmap/data` | Path to CellMap zarr data |
+| `data.target_mode` | `overlay` | `overlay` = EM + colored organelles, `segmentation` = colored mask on black background |
+| `data.auto_norms` | `false` | Compute per-dataset intensity normalization from data percentiles instead of using `norms_csv` |
+| `data.auto_norms_percentile_low` | `1.0` | Lower percentile for auto-norm clipping |
+| `data.auto_norms_percentile_high` | `99.0` | Upper percentile for auto-norm clipping |
+| `training.max_train_steps` | `5000` | Number of training steps |
+| `training.output_dir` | varies | Where to save LoRA weights |
+| `training.flux2_conditioning` | `noise_endpoint` | Flux2 only: `noise_endpoint` (blend EM latents with noise) or `concatenate` (Kontext-style sequence concat) |
+| `training.flux2_noise_mix` | `0.5` | Flux2 noise_endpoint only: blend between EM latents (0) and pure noise (1) |
+
+### Preview normalization
+
+Inspect per-dataset intensity normalization before training:
+
+```bash
+# Preview with current norms.csv
+pixi run python scripts/preview_crop_norms.py --output-dir runs/norm_previews
+
+# Preview with auto-computed norms (also saves auto_norms.csv)
+pixi run python scripts/preview_crop_norms.py --auto-norms --output-dir runs/norm_previews
+```
+
+Each preview shows a side-by-side comparison: auto-stretched (full range) vs. the applied normalization, annotated with dataset name, norm params, and raw intensity stats.
 
 ### Hardware
 
@@ -145,7 +177,11 @@ src/ask_to_mask/
     dataset.py     # CellMapFluxDataset: zarr-backed training data
     zarr_utils.py  # Zarr reading utilities (adapted from sam3m)
     train.py       # LoRA training loop with accelerate + PEFT
+scripts/
+  preview_crop_norms.py # Preview and auto-compute intensity normalization per dataset
 configs/
-  train_lora.yaml  # Training configuration
-  norms.csv        # Per-dataset intensity normalization
+  train_lora.yaml                  # Kontext training configuration
+  train_lora_flux2.yaml            # Flux2-dev training configuration
+  train_lora_flux2_r64_autonorm.yaml # Flux2-dev with auto-norms, rank 64
+  norms.csv                        # Per-dataset intensity normalization (manual)
 ```
