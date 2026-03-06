@@ -1,6 +1,6 @@
 """Organelle class definitions: names, colors, and prompt templates."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -40,6 +40,17 @@ class OrganelleClass:
         )
         return " ".join(parts)
 
+    def build_prompt_varied(
+        self, rng, resolution_nm: float | None = None,
+    ) -> str:
+        """Build a prompt using a randomly selected template for training."""
+        parts = self._build_context(resolution_nm=resolution_nm)
+        idx = rng.integers(len(PROMPT_TEMPLATES))
+        parts.append(
+            PROMPT_TEMPLATES[idx].format(name=self.name, color_name=self.color_name)
+        )
+        return " ".join(parts)
+
     def build_instance_prompt(
         self, detailed: bool = False, resolution_nm: float | None = None,
     ) -> str:
@@ -50,6 +61,50 @@ class OrganelleClass:
             f"to distinguish separate instances. Keep everything else unchanged."
         )
         return " ".join(parts)
+
+
+# Alternative prompt templates for training variation.
+# Each must contain {name} and {color_name} placeholders.
+PROMPT_TEMPLATES = [
+    "Color all the {name} in {color_name}. Keep everything else unchanged.",
+    "Highlight the {name} in {color_name}. Do not change anything else.",
+    "Paint all {name} {color_name}. Leave everything else as is.",
+    "Mark the {name} with {color_name}. Keep the rest unchanged.",
+    "Color every {name} {color_name}. Do not modify the background.",
+]
+
+# Alternative templates for multi-organelle prompts.
+# Each must contain {instructions} placeholder.
+MULTI_PROMPT_TEMPLATES = [
+    "Color {instructions}. Keep everything else unchanged.",
+    "Highlight {instructions}. Do not change anything else.",
+    "Paint {instructions}. Leave everything else as is.",
+    "Mark {instructions}. Keep the rest unchanged.",
+]
+
+
+def build_multi_organelle_prompt(
+    organelles: list[OrganelleClass],
+    resolution_nm: float | None = None,
+    rng=None,
+) -> str:
+    """Build a prompt that asks the model to color multiple organelles at once."""
+    parts = ["This is an EM image of cell(s)."]
+    if resolution_nm is not None:
+        parts.append(f"The image resolution is {resolution_nm:.0f}nm/px.")
+    color_instructions = [
+        f"the {org.name} in {org.color_name}" for org in organelles
+    ]
+    if len(color_instructions) == 1:
+        joined = color_instructions[0]
+    else:
+        joined = ", ".join(color_instructions[:-1]) + " and " + color_instructions[-1]
+    if rng is not None:
+        idx = rng.integers(len(MULTI_PROMPT_TEMPLATES))
+        parts.append(MULTI_PROMPT_TEMPLATES[idx].format(instructions=joined))
+    else:
+        parts.append(f"Color {joined}. Keep everything else unchanged.")
+    return " ".join(parts)
 
 
 ORGANELLES: dict[str, OrganelleClass] = {

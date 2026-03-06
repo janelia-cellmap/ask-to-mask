@@ -26,6 +26,7 @@ data:
   # include_datasets: null  # null = all datasets
   # "overlay" = EM + colored organelles, "segmentation" = colored mask on black
   target_mode: overlay
+  include_resolution: true
 
 training:
   batch_size: 16

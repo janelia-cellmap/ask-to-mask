@@ -25,6 +25,7 @@ data:
   skip_datasets: []
   # "overlay" = EM + colored organelles, "segmentation" = colored mask on black
   target_mode: segmentation
+  include_resolution: true
 
 training:
   batch_size: 4

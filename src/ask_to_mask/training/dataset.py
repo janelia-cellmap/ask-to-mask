@@ -11,7 +11,7 @@ from PIL import Image
 from scipy.ndimage import zoom as ndimage_zoom
 from torch.utils.data import Dataset
 
-from ..config import ORGANELLE_FINE_CLASSES, ORGANELLES, OrganelleClass
+from ..config import ORGANELLE_FINE_CLASSES, ORGANELLES, OrganelleClass, build_multi_organelle_prompt
 from .zarr_utils import (
     CropInfo,
     compute_auto_norms,
@@ -58,6 +58,9 @@ class CellMapFluxDataset(Dataset):
         auto_norms_per_image: bool = False,
         auto_norms_percentile_low: float = 1.0,
         auto_norms_percentile_high: float = 99.0,
+        multi_organelle_prob: float = 0.0,
+        negative_example_prob: float = 0.0,
+        prompt_variation: bool = False,
     ):
         self.samples_per_epoch = samples_per_epoch
         self.min_mask_fraction = min_mask_fraction
@@ -66,6 +69,9 @@ class CellMapFluxDataset(Dataset):
         self.auto_norms_per_image = auto_norms_per_image
         self.auto_norms_percentile_low = auto_norms_percentile_low
         self.auto_norms_percentile_high = auto_norms_percentile_high
+        self.multi_organelle_prob = multi_organelle_prob
+        self.negative_example_prob = negative_example_prob
+        self.prompt_variation = prompt_variation
         self.rng = np.random.default_rng(seed)
         self.augment = augment
 
@@ -135,6 +141,13 @@ class CellMapFluxDataset(Dataset):
         if not self.organelle_keys:
             raise RuntimeError("No organelles have matching annotated crops")
 
+        # Build reverse index: crop -> list of organelle keys present
+        self._crop_organelles: dict[str, list[str]] = {}
+        for key, crops_list in self.organelle_crops.items():
+            for c in crops_list:
+                crop_id = f"{c.dataset_name}:{c.crop_name}"
+                self._crop_organelles.setdefault(crop_id, []).append(key)
+
         # Class-balanced sampling state
         self._class_counts = {k: 0 for k in self.organelle_keys}
 
@@ -167,32 +180,21 @@ class CellMapFluxDataset(Dataset):
         self._class_counts[key] += 1
         return key
 
-    def _try_sample(
-        self, skip_mask_filter: bool = False
-    ) -> tuple[Image.Image, Image.Image, str] | None:
-        """Try to produce one valid sample, or return None."""
-        organelle_key = self._pick_organelle()
-        organelle = ORGANELLES[organelle_key]
-        fine_classes = ORGANELLE_FINE_CLASSES[organelle_key]
-        crops = self.organelle_crops[organelle_key]
-        crop = crops[self.rng.integers(len(crops))]
+    def _get_crop_geometry(self, crop: CropInfo):
+        """Compute crop geometry for slice reading.
 
-        # Determine crop YX size in voxels at native resolution
+        Returns (is_small, z_extent_vox, subcrop_origin_world) or None.
+        """
         crop_extent = np.array(crop.crop_extent_world)
         crop_origin = np.array(crop.crop_origin_world)
         raw_res = np.array(crop.raw_resolution)
         crop_yx_voxels = crop_extent[1:] / raw_res[1:]
 
         is_small = np.all(crop_yx_voxels < SMALL_CROP_THRESHOLD)
-
-        # Pick a random Z-slice within the crop
         z_extent_vox = int(crop_extent[0] / raw_res[0])
         if z_extent_vox < 1:
             return None
-        z_idx_in_crop = self.rng.integers(z_extent_vox)
 
-        # For large crops, compute a random sub-crop origin in world coords
-        # so both raw and label readers use the same region.
         subcrop_origin_world = None
         if not is_small:
             world_extent_yx = TARGET_SIZE * raw_res[1:]
@@ -210,6 +212,24 @@ class CellMapFluxDataset(Dataset):
                     crop_origin[1], crop_origin[2]
                 ])
 
+        return is_small, z_extent_vox, subcrop_origin_world
+
+    def _try_sample(
+        self, skip_mask_filter: bool = False
+    ) -> tuple[Image.Image, Image.Image, str] | None:
+        """Try to produce one valid sample, or return None."""
+        organelle_key = self._pick_organelle()
+        organelle = ORGANELLES[organelle_key]
+        fine_classes = ORGANELLE_FINE_CLASSES[organelle_key]
+        crops = self.organelle_crops[organelle_key]
+        crop = crops[self.rng.integers(len(crops))]
+
+        geom = self._get_crop_geometry(crop)
+        if geom is None:
+            return None
+        is_small, z_extent_vox, subcrop_origin_world = geom
+        z_idx_in_crop = self.rng.integers(z_extent_vox)
+
         # Read raw 2D slice
         raw_slice = self._read_raw_slice(
             crop, z_idx_in_crop, is_small, subcrop_origin_world
@@ -217,32 +237,65 @@ class CellMapFluxDataset(Dataset):
         if raw_slice is None:
             return None
 
-        # Read and union label slices
-        mask = self._read_label_slice(
-            crop, fine_classes, z_idx_in_crop, raw_slice.shape,
-            is_small, subcrop_origin_world,
+        # Check if this should be a negative example (no coloring)
+        is_negative = (
+            self.negative_example_prob > 0
+            and self.rng.random() < self.negative_example_prob
         )
-        if mask is None:
-            return None
-
-        # Check mask fraction
-        if not skip_mask_filter:
-            mask_fraction = mask.sum() / mask.size
-            if mask_fraction < self.min_mask_fraction:
-                return None
 
         # Build images
-        # raw_slice is float32 [0,1], shape [H, W]
         raw_uint8 = (raw_slice * 255).astype(np.uint8)
         raw_rgb = np.stack([raw_uint8] * 3, axis=-1)  # [H, W, 3]
 
-        # Create target: color organelle pixels
-        if self.target_mode == "segmentation":
-            target_rgb = np.zeros_like(raw_rgb)
+        if is_negative:
+            # Negative example: target = input, no coloring
+            if self.target_mode == "segmentation":
+                target_rgb = np.zeros_like(raw_rgb)
+            else:
+                target_rgb = raw_rgb.copy()
+            organelles_used = [organelle]
         else:
-            target_rgb = raw_rgb.copy()
-        color = np.array(organelle.rgb, dtype=np.uint8)
-        target_rgb[mask > 0] = color
+            # Determine which organelles to color
+            organelles_to_color = [(organelle_key, organelle, fine_classes)]
+
+            # Maybe add more organelles from the same crop
+            if self.multi_organelle_prob > 0 and self.rng.random() < self.multi_organelle_prob:
+                crop_id = f"{crop.dataset_name}:{crop.crop_name}"
+                available = [
+                    k for k in self._crop_organelles.get(crop_id, [])
+                    if k != organelle_key
+                ]
+                if available:
+                    n_extra = min(self.rng.integers(1, 3), len(available))
+                    extras = self.rng.choice(available, size=n_extra, replace=False)
+                    for ek in extras:
+                        organelles_to_color.append(
+                            (ek, ORGANELLES[ek], ORGANELLE_FINE_CLASSES[ek])
+                        )
+
+            # Create target image
+            if self.target_mode == "segmentation":
+                target_rgb = np.zeros_like(raw_rgb)
+            else:
+                target_rgb = raw_rgb.copy()
+
+            has_any_mask = False
+            organelles_used = []
+            for org_key, org, fc in organelles_to_color:
+                mask = self._read_label_slice(
+                    crop, fc, z_idx_in_crop, raw_slice.shape,
+                    is_small, subcrop_origin_world,
+                )
+                if mask is not None:
+                    mask_fraction = mask.sum() / mask.size
+                    if skip_mask_filter or mask_fraction >= self.min_mask_fraction:
+                        color = np.array(org.rgb, dtype=np.uint8)
+                        target_rgb[mask > 0] = color
+                        has_any_mask = True
+                        organelles_used.append(org)
+
+            if not has_any_mask:
+                return None
 
         # Apply augmentation (same transform to both)
         if self.augment:
@@ -258,7 +311,19 @@ class CellMapFluxDataset(Dataset):
             raw_res = crop.raw_resolution
             resolution_nm = (raw_res[1] + raw_res[2]) / 2.0
 
-        prompt = organelle.build_prompt(resolution_nm=resolution_nm)
+        # Build prompt
+        if len(organelles_used) == 1:
+            if self.prompt_variation:
+                prompt = organelles_used[0].build_prompt_varied(
+                    rng=self.rng, resolution_nm=resolution_nm,
+                )
+            else:
+                prompt = organelles_used[0].build_prompt(resolution_nm=resolution_nm)
+        else:
+            prompt = build_multi_organelle_prompt(
+                organelles_used, resolution_nm=resolution_nm,
+                rng=self.rng if self.prompt_variation else None,
+            )
         return cond_pil, target_pil, prompt
 
     def _read_raw_slice(
@@ -439,7 +504,8 @@ class CellMapFluxDataset(Dataset):
     def _augment(
         self, raw: np.ndarray, target: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Apply random spatial augmentations to both images identically."""
+        """Apply random spatial and intensity augmentations."""
+        # --- Spatial augmentations (applied to both identically) ---
         # Random horizontal flip
         if self.rng.random() > 0.5:
             raw = np.flip(raw, axis=1).copy()
@@ -456,7 +522,43 @@ class CellMapFluxDataset(Dataset):
             raw = np.rot90(raw, k, axes=(0, 1)).copy()
             target = np.rot90(target, k, axes=(0, 1)).copy()
 
+        # --- Intensity augmentations (EM pixels only) ---
+        # Sample random params once so raw and target get the same transform
+        intensity_params = self._sample_intensity_params()
+        raw = self._apply_intensity(raw, intensity_params)
+        if self.target_mode == "overlay":
+            # For overlay targets, apply same intensity transform to EM
+            # background but preserve colored organelle pixels.
+            gray_mask = (
+                (target[:, :, 0] == target[:, :, 1])
+                & (target[:, :, 1] == target[:, :, 2])
+            )
+            target_aug = self._apply_intensity(target, intensity_params)
+            target[gray_mask] = target_aug[gray_mask]
+
         return raw, target
+
+    def _sample_intensity_params(self) -> dict:
+        """Sample random intensity augmentation parameters."""
+        return {
+            "brightness": float(self.rng.uniform(-20, 20)),
+            "contrast": float(self.rng.uniform(0.8, 1.2)),
+            "gamma": float(self.rng.uniform(0.8, 1.2)),
+            "noise_sigma": float(self.rng.uniform(0, 5)),
+        }
+
+    def _apply_intensity(self, img: np.ndarray, params: dict) -> np.ndarray:
+        """Apply intensity augmentations with pre-sampled parameters."""
+        img = img.astype(np.float32)
+        img = img + params["brightness"]
+        mean = img.mean()
+        img = (img - mean) * params["contrast"] + mean
+        img = np.clip(img, 0, 255)
+        img = 255.0 * (img / 255.0) ** params["gamma"]
+        if params["noise_sigma"] > 0:
+            noise = self.rng.normal(0, params["noise_sigma"], img.shape)
+            img = img + noise
+        return np.clip(img, 0, 255).astype(np.uint8)
 
     def _to_square_pil(self, img_rgb: np.ndarray) -> Image.Image:
         """Pad to square and resize to TARGET_SIZE x TARGET_SIZE."""

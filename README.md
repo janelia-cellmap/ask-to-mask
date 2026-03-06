@@ -141,6 +141,10 @@ Edit `configs/train_lora.yaml` (Kontext) or `configs/train_lora_flux2.yaml` (Flu
 | `data.auto_norms` | `false` | Compute per-dataset intensity normalization from data percentiles instead of using `norms_csv` |
 | `data.auto_norms_percentile_low` | `1.0` | Lower percentile for auto-norm clipping |
 | `data.auto_norms_percentile_high` | `99.0` | Upper percentile for auto-norm clipping |
+| `data.include_resolution` | `true` | Include image resolution (nm/px) in training prompts |
+| `data.multi_organelle_prob` | `0.0` | Probability of coloring 2-3 organelles per image (e.g. `0.3`) |
+| `data.negative_example_prob` | `0.0` | Probability of serving a no-organelle example where target = input (e.g. `0.15`) |
+| `data.prompt_variation` | `false` | Randomly vary prompt wording during training |
 | `training.max_train_steps` | `5000` | Number of training steps |
 | `training.output_dir` | varies | Where to save LoRA weights |
 | `training.flux2_conditioning` | `noise_endpoint` | Flux2 only: `noise_endpoint` (blend EM latents with noise) or `concatenate` (Kontext-style sequence concat) |
