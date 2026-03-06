@@ -211,7 +211,7 @@ packages:
 - pypi: .
   name: ask-to-mask
   version: 0.1.0
-  sha256: d95b1bf96f8f5aa4c05b307973f19925ac2127e829d069468b60c322ce13356e
+  sha256: 810e8687287fad56d8f10b2606ca7b725b022ee54239c793c26892d13198d529
   requires_dist:
   - diffusers>=0.32.0
   - transformers
@@ -227,6 +227,13 @@ packages:
   - pyyaml ; extra == 'train'
   - tensorboard ; extra == 'train'
   - bitsandbytes ; extra == 'train'
+  - ollama>=0.4.0 ; extra == 'agents'
+  - ollama>=0.4.0 ; extra == 'agents-anthropic'
+  - anthropic>=0.40.0 ; extra == 'agents-anthropic'
+  - ollama>=0.4.0 ; extra == 'agents-google'
+  - google-genai>=1.0.0 ; extra == 'agents-google'
+  - ollama>=0.4.0 ; extra == 'agents-openai'
+  - openai>=1.0.0 ; extra == 'agents-openai'
   requires_python: '>=3.12'
   editable: true
 - conda: https://conda.anaconda.org/conda-forge/linux-64/bzip2-1.0.8-hda65f42_9.conda

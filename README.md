@@ -100,6 +100,57 @@ Each organelle is assigned a distinct high-contrast color for clean mask extract
 | `heterochromatin` | Heterochromatin | Spring green | 100-5000 nm |
 | `euchromatin` | Euchromatin | Rose | 100-10000 nm |
 
+## Agentic refinement
+
+Iteratively improve mask quality using a VLM evaluator agent. Each iteration generates a mask, sends it (alongside the original EM image) to a vision-language model for critique, and uses the feedback to refine the prompt and parameters.
+
+### Setup
+
+```bash
+# Install agent dependencies (ollama backend)
+pip install -e '.[agents]'
+
+# For other LLM providers:
+pip install -e '.[agents-anthropic]'  # Claude
+pip install -e '.[agents-google]'     # Gemini
+pip install -e '.[agents-openai]'     # GPT-4o
+```
+
+The ollama backend requires a running ollama server with a vision model:
+
+```bash
+ollama serve
+ollama pull llama3.2-vision
+```
+
+### Run
+
+```bash
+# Basic refinement loop with ollama (free, local)
+pixi run segment refine --input image.png --output-dir ./refined/ --organelle mito
+
+# Use a different LLM provider
+pixi run segment refine --input image.png --output-dir ./refined/ --organelle mito \
+    --llm-provider anthropic --llm-model claude-sonnet-4-20250514
+
+# Customize loop parameters
+pixi run segment refine --input image.png --output-dir ./refined/ --organelle mito \
+    --max-iterations 3 --min-score 0.9 --guidance-scale 4.0
+
+# Use Flux2 with LoRA weights
+pixi run segment refine --input image.png --output-dir ./refined/ --organelle mito \
+    --model flux2-dev --lora checkpoints/flux2-lora
+```
+
+Each iteration saves `colored.png`, `mask.png`, and `evaluation.json` to `iteration_00/`, `iteration_01/`, etc. The loop stops when the evaluator scores the mask above `--min-score` or `--max-iterations` is reached.
+
+### Architecture
+
+Both the image generation model and the evaluator VLM are pluggable:
+
+- **Image gen backends** (`--gen-backend`): `flux` (default). Extensible to other models.
+- **LLM backends** (`--llm-provider`): `ollama`, `anthropic`, `google`, `openai`.
+
 ## LoRA finetuning
 
 Finetune Flux on annotated CellMap EM data to improve organelle recognition.
@@ -177,6 +228,12 @@ src/ask_to_mask/
   model.py         # Flux model loading and inference (with LoRA support)
   pipeline.py      # Orchestrates load → prompt → infer → postprocess
   postprocess.py   # Mask extraction (semantic + instance)
+  agents/
+    gen_backend.py # Pluggable image generation backends (Flux, etc.)
+    llm_backend.py # Pluggable LLM/VLM backends (ollama, Anthropic, Google, OpenAI)
+    evaluator.py   # Combined critic+refiner agent
+    loop.py        # Generate-evaluate-refine orchestrator
+    schemas.py     # Dataclasses for structured data exchange
   training/
     dataset.py     # CellMapFluxDataset: zarr-backed training data
     zarr_utils.py  # Zarr reading utilities (adapted from sam3m)

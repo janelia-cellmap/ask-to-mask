@@ -3,8 +3,28 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
+
+
+def _load_dotenv() -> None:
+    """Load .env file from project root if it exists."""
+    env_file = Path(__file__).resolve().parents[2] / ".env"
+    if not env_file.is_file():
+        return
+    with open(env_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            key, _, value = line.partition("=")
+            key, value = key.strip(), value.strip()
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+_load_dotenv()
 
 from .config import DEFAULT_MODEL, MODELS, ORGANELLES
 
@@ -95,6 +115,62 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--resume", type=str, default=None, help="Resume from checkpoint directory."
     )
 
+    # --- refine ---
+    ref = sub.add_parser(
+        "refine",
+        help="Iteratively refine mask quality using a VLM evaluator agent.",
+    )
+    ref.add_argument("--input", type=Path, required=True, help="Path to an EM image.")
+    ref.add_argument(
+        "--output-dir", type=Path, required=True, help="Directory to save results."
+    )
+    ref.add_argument(
+        "--organelle",
+        required=True,
+        choices=list(ORGANELLES.keys()),
+        help="Organelle class to segment.",
+    )
+    ref.add_argument(
+        "--gen-backend", default="flux", help="Image generation backend (default: flux)."
+    )
+    ref.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        choices=list(MODELS.keys()),
+        help=f"Flux model to use (default: {DEFAULT_MODEL}).",
+    )
+    ref.add_argument("--lora", type=str, default=None, help="Path to LoRA weights.")
+    ref.add_argument("--device", default="cuda", help="Torch device (default: cuda).")
+    ref.add_argument(
+        "--llm-provider",
+        default="ollama",
+        choices=["ollama", "anthropic", "google", "openai"],
+        help="LLM/VLM provider for evaluation (default: ollama).",
+    )
+    ref.add_argument("--llm-model", default=None, help="LLM model name.")
+    ref.add_argument(
+        "--ollama-host",
+        default="http://localhost:11434",
+        help="Ollama server URL.",
+    )
+    ref.add_argument(
+        "--max-iterations", type=int, default=5, help="Max refinement iterations."
+    )
+    ref.add_argument(
+        "--min-score", type=float, default=0.8, help="Min acceptable score to stop."
+    )
+    ref.add_argument(
+        "--save-intermediates",
+        action="store_true",
+        default=True,
+        help="Save each iteration's outputs (default: True).",
+    )
+    ref.add_argument("--num-steps", type=int, default=28, help="Inference steps.")
+    ref.add_argument("--guidance-scale", type=float, default=3.5, help="Guidance scale.")
+    ref.add_argument("--strength", type=float, default=0.75, help="Edit strength.")
+    ref.add_argument("--threshold", type=float, default=30.0, help="Mask threshold.")
+    ref.add_argument("--seed", type=int, default=None, help="Random seed.")
+
     # --- list-organelles ---
     sub.add_parser("list-organelles", help="List available organelle classes.")
 
@@ -152,6 +228,77 @@ def cmd_segment(args: argparse.Namespace) -> None:
     print("\nDone.")
 
 
+def cmd_refine(args: argparse.Namespace) -> None:
+    from .agents import (
+        GenerationParams,
+        LoopConfig,
+        create_gen_backend,
+        create_llm_backend,
+        run_refinement_loop,
+    )
+    from .pipeline import load_em_image
+
+    organelle = ORGANELLES[args.organelle]
+
+    # Build LLM backend kwargs
+    llm_kwargs = {}
+    if args.llm_model:
+        llm_kwargs["model"] = args.llm_model
+    if args.llm_provider == "ollama":
+        llm_kwargs["host"] = args.ollama_host
+
+    llm_backend = create_llm_backend(args.llm_provider, **llm_kwargs)
+
+    # Build gen backend
+    gen_backend = create_gen_backend(
+        args.gen_backend,
+        model_key=args.model,
+        lora_path=args.lora,
+        device=args.device,
+        organelle_rgb=organelle.rgb,
+    )
+
+    em_image = load_em_image(args.input)
+    initial_prompt = organelle.build_prompt(detailed=False)
+
+    initial_params = GenerationParams(
+        prompt=initial_prompt,
+        num_inference_steps=args.num_steps,
+        guidance_scale=args.guidance_scale,
+        strength=args.strength,
+        seed=args.seed,
+        threshold=args.threshold,
+    )
+
+    config = LoopConfig(
+        max_iterations=args.max_iterations,
+        min_acceptable_score=args.min_score,
+        save_intermediates=args.save_intermediates,
+    )
+
+    print(f"Refining {organelle.name} segmentation on {args.input.name}")
+    print(f"  Gen backend: {args.gen_backend} ({args.model})")
+    print(f"  LLM provider: {args.llm_provider}")
+    print(f"  Max iterations: {args.max_iterations}, min score: {args.min_score}")
+
+    result = run_refinement_loop(
+        gen_backend=gen_backend,
+        llm_backend=llm_backend,
+        em_image=em_image,
+        organelle=organelle,
+        initial_params=initial_params,
+        config=config,
+        output_dir=args.output_dir,
+    )
+
+    status = "converged" if result.converged else "max iterations reached"
+    print(f"\n=== Done ({status}) ===")
+    print(f"  Best score: {result.best_evaluation.score:.2f}")
+    print(f"  Total iterations: {result.total_iterations}")
+    if args.save_intermediates:
+        print(f"  Results saved to: {args.output_dir}")
+
+
 def cmd_train(args: argparse.Namespace) -> None:
     from .training.train import train
 
@@ -165,6 +312,8 @@ def main(argv: list[str] | None = None) -> None:
         cmd_list_organelles()
     elif args.command == "segment":
         cmd_segment(args)
+    elif args.command == "refine":
+        cmd_refine(args)
     elif args.command == "train":
         cmd_train(args)
 
