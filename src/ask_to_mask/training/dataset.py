@@ -14,6 +14,7 @@ from torch.utils.data import Dataset
 from ..config import ORGANELLE_FINE_CLASSES, ORGANELLES, OrganelleClass
 from .zarr_utils import (
     CropInfo,
+    compute_auto_norms,
     discover_crops,
     load_norms,
     normalize_raw,
@@ -51,9 +52,20 @@ class CellMapFluxDataset(Dataset):
         cache_dir: str | None = None,
         seed: int = 42,
         augment: bool = True,
+        target_mode: str = "overlay",
+        include_resolution: bool = False,
+        auto_norms: bool = False,
+        auto_norms_per_image: bool = False,
+        auto_norms_percentile_low: float = 1.0,
+        auto_norms_percentile_high: float = 99.0,
     ):
         self.samples_per_epoch = samples_per_epoch
         self.min_mask_fraction = min_mask_fraction
+        self.target_mode = target_mode
+        self.include_resolution = include_resolution
+        self.auto_norms_per_image = auto_norms_per_image
+        self.auto_norms_percentile_low = auto_norms_percentile_low
+        self.auto_norms_percentile_high = auto_norms_percentile_high
         self.rng = np.random.default_rng(seed)
         self.augment = augment
 
@@ -90,6 +102,21 @@ class CellMapFluxDataset(Dataset):
         )
         if not self.crops:
             raise RuntimeError(f"No crops found in {data_root}")
+
+        # Optionally compute auto norms from data percentiles
+        if auto_norms:
+            logger.info(
+                f"Computing auto norms (p{auto_norms_percentile_low}"
+                f"-p{auto_norms_percentile_high})..."
+            )
+            auto = compute_auto_norms(
+                self.crops,
+                percentile_low=auto_norms_percentile_low,
+                percentile_high=auto_norms_percentile_high,
+            )
+            for crop in self.crops:
+                if crop.dataset_name in auto:
+                    crop.norm_params = auto[crop.dataset_name]
 
         # Build organelle -> list of crops that have at least one fine class
         self.organelle_crops: dict[str, list[CropInfo]] = {}
@@ -210,7 +237,10 @@ class CellMapFluxDataset(Dataset):
         raw_rgb = np.stack([raw_uint8] * 3, axis=-1)  # [H, W, 3]
 
         # Create target: color organelle pixels
-        target_rgb = raw_rgb.copy()
+        if self.target_mode == "segmentation":
+            target_rgb = np.zeros_like(raw_rgb)
+        else:
+            target_rgb = raw_rgb.copy()
         color = np.array(organelle.rgb, dtype=np.uint8)
         target_rgb[mask > 0] = color
 
@@ -222,7 +252,13 @@ class CellMapFluxDataset(Dataset):
         cond_pil = self._to_square_pil(raw_rgb)
         target_pil = self._to_square_pil(target_rgb)
 
-        prompt = organelle.build_prompt()
+        # Use YX resolution (average of Y and X) as nm/px
+        resolution_nm = None
+        if self.include_resolution:
+            raw_res = crop.raw_resolution
+            resolution_nm = (raw_res[1] + raw_res[2]) / 2.0
+
+        prompt = organelle.build_prompt(resolution_nm=resolution_nm)
         return cond_pil, target_pil, prompt
 
     def _read_raw_slice(
@@ -288,7 +324,13 @@ class CellMapFluxDataset(Dataset):
             x_end = min(x_start + x_size_vox, raw_shape[2])
 
         raw_2d = np.array(raw_arr[z_vox, y_start:y_end, x_start:x_end])
-        raw_2d = normalize_raw(raw_2d, crop.norm_params)
+        if self.auto_norms_per_image:
+            from .zarr_utils import NormParams
+            p_low = float(np.percentile(raw_2d, self.auto_norms_percentile_low))
+            p_high = float(np.percentile(raw_2d, self.auto_norms_percentile_high))
+            raw_2d = normalize_raw(raw_2d, NormParams(p_low, p_high, False))
+        else:
+            raw_2d = normalize_raw(raw_2d, crop.norm_params)
         return raw_2d
 
     def _read_label_slice(

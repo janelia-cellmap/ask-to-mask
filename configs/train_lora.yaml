@@ -24,6 +24,8 @@ data:
   cache_dir: configs
   skip_datasets: []
   # include_datasets: null  # null = all datasets
+  # "overlay" = EM + colored organelles, "segmentation" = colored mask on black
+  target_mode: overlay
 
 training:
   batch_size: 16

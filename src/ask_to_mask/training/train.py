@@ -18,7 +18,7 @@ from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
-# Default LoRA target modules for Flux transformer
+# Default LoRA target modules for Flux Kontext / Flux1 transformer
 DEFAULT_TARGET_MODULES = [
     "attn.to_k",
     "attn.to_q",
@@ -33,6 +33,28 @@ DEFAULT_TARGET_MODULES = [
     "ff_context.net.0.proj",
     "ff_context.net.2",
     "proj_mlp",
+    "proj_out",
+]
+
+# Default LoRA target modules for Flux2 transformer
+DEFAULT_TARGET_MODULES_FLUX2 = [
+    # Double stream attention
+    "attn.to_q",
+    "attn.to_k",
+    "attn.to_v",
+    "attn.to_out.0",
+    "attn.add_q_proj",
+    "attn.add_k_proj",
+    "attn.add_v_proj",
+    "attn.to_add_out",
+    # Double stream feedforward
+    "ff.linear_in",
+    "ff.linear_out",
+    "ff_context.linear_in",
+    "ff_context.linear_out",
+    # Single stream (fused QKV + MLP projection)
+    "attn.to_qkv_mlp_proj",
+    # Output
     "proj_out",
 ]
 
@@ -62,57 +84,110 @@ def pil_to_tensor(images: list[Image.Image], device, dtype) -> torch.Tensor:
     return torch.stack(tensors).to(device=device, dtype=dtype)
 
 
-def encode_images(vae, images_tensor: torch.Tensor) -> torch.Tensor:
-    """Encode images to latents using VAE."""
+def encode_images(vae, images_tensor: torch.Tensor, is_flux2: bool = False) -> torch.Tensor:
+    """Encode images to latents using VAE.
+
+    For Flux1/Kontext: applies shift_factor + scaling_factor normalization.
+    For Flux2: applies patchify + batch norm normalization.
+    """
     with torch.no_grad():
         latents = vae.encode(images_tensor).latent_dist.sample()
-    latents = (latents - vae.config.shift_factor) * vae.config.scaling_factor
+    if is_flux2:
+        from diffusers import Flux2Pipeline
+
+        latents = Flux2Pipeline._patchify_latents(latents)
+        bn_mean = vae.bn.running_mean.view(1, -1, 1, 1).to(latents.device, latents.dtype)
+        bn_std = torch.sqrt(
+            vae.bn.running_var.view(1, -1, 1, 1) + vae.config.batch_norm_eps
+        ).to(latents.device, latents.dtype)
+        latents = (latents - bn_mean) / bn_std
+    else:
+        latents = (latents - vae.config.shift_factor) * vae.config.scaling_factor
     return latents
 
 
-def pack_latents(latents: torch.Tensor) -> torch.Tensor:
-    """Pack 4D latents [B, C, H, W] into sequence format [B, N, C*4].
+def pack_latents(latents: torch.Tensor, is_flux2: bool = False) -> torch.Tensor:
+    """Pack latents into sequence format.
 
-    Matches FluxKontextPipeline._pack_latents.
+    Flux1/Kontext: [B, C, H, W] -> [B, H//2 * W//2, C*4] (patchify + flatten).
+    Flux2: [B, C*4, H/2, W/2] -> [B, H/2 * W/2, C*4] (already patchified).
     """
-    b, c, h, w = latents.shape
-    latents = latents.view(b, c, h // 2, 2, w // 2, 2)
-    latents = latents.permute(0, 2, 4, 1, 3, 5)
-    latents = latents.reshape(b, (h // 2) * (w // 2), c * 4)
-    return latents
+    if is_flux2:
+        b, c, h, w = latents.shape
+        return latents.reshape(b, c, h * w).permute(0, 2, 1)
+    else:
+        b, c, h, w = latents.shape
+        latents = latents.view(b, c, h // 2, 2, w // 2, 2)
+        latents = latents.permute(0, 2, 4, 1, 3, 5)
+        latents = latents.reshape(b, (h // 2) * (w // 2), c * 4)
+        return latents
 
 
 def prepare_latent_image_ids(
-    height: int, width: int, device, dtype
+    height: int, width: int, device, dtype, is_flux2: bool = False,
+    batch_size: int = 1,
 ) -> torch.Tensor:
     """Create position IDs for packed latents.
 
-    Args:
-        height, width: latent dimensions // 2 (after packing).
-
-    Returns [H * W, 3] tensor with [type_id, y_pos, x_pos].
+    Flux1/Kontext: [H*W, 3] with (type_id, y, x).
+    Flux2: [B, H*W, 4] with (T, H, W, L).
     """
-    ids = torch.zeros(height, width, 3, device=device, dtype=dtype)
-    ids[..., 1] = torch.arange(height, device=device)[:, None]
-    ids[..., 2] = torch.arange(width, device=device)[None, :]
-    ids = ids.reshape(height * width, 3)
-    return ids
+    if is_flux2:
+        t = torch.arange(1)
+        h = torch.arange(height)
+        w = torch.arange(width)
+        l = torch.arange(1)
+        ids = torch.cartesian_prod(t, h, w, l)
+        ids = ids.unsqueeze(0).expand(batch_size, -1, -1)
+        return ids.to(device=device, dtype=dtype)
+    else:
+        ids = torch.zeros(height, width, 3, device=device, dtype=dtype)
+        ids[..., 1] = torch.arange(height, device=device)[:, None]
+        ids[..., 2] = torch.arange(width, device=device)[None, :]
+        ids = ids.reshape(height * width, 3)
+        return ids
 
 
-def encode_prompt(pipe, prompts: list[str], device, dtype):
+def prepare_flux2_cond_ids(
+    height: int, width: int, device, dtype, batch_size: int = 1, scale: int = 10,
+) -> torch.Tensor:
+    """Create conditioning image IDs for Flux2 concatenate mode.
+
+    Uses T = scale (offset from target T=0) to distinguish conditioning tokens.
+    Returns [B, H*W, 4] with (T, H, W, L).
+    """
+    t = torch.tensor([scale])
+    h = torch.arange(height)
+    w = torch.arange(width)
+    l = torch.arange(1)
+    ids = torch.cartesian_prod(t, h, w, l)
+    ids = ids.unsqueeze(0).expand(batch_size, -1, -1)
+    return ids.to(device=device, dtype=dtype)
+
+
+def encode_prompt(pipe, prompts: list[str], device, dtype, is_flux2: bool = False):
     """Encode text prompts using the pipeline's text encoders.
 
     Returns (prompt_embeds, pooled_prompt_embeds, text_ids).
+    pooled_prompt_embeds is None for Flux2.
     """
-    # Use the pipeline's encode_prompt method which handles both CLIP + T5
-    prompt_embeds, pooled_prompt_embeds, text_ids = pipe.encode_prompt(
-        prompt=prompts,
-        prompt_2=None,
-        device=device,
-        num_images_per_prompt=1,
-        max_sequence_length=512,
-    )
-    return prompt_embeds, pooled_prompt_embeds, text_ids
+    if is_flux2:
+        prompt_embeds, text_ids = pipe.encode_prompt(
+            prompt=prompts,
+            device=device,
+            num_images_per_prompt=1,
+            max_sequence_length=512,
+        )
+        return prompt_embeds, None, text_ids
+    else:
+        prompt_embeds, pooled_prompt_embeds, text_ids = pipe.encode_prompt(
+            prompt=prompts,
+            prompt_2=None,
+            device=device,
+            num_images_per_prompt=1,
+            max_sequence_length=512,
+        )
+        return prompt_embeds, pooled_prompt_embeds, text_ids
 
 
 def pil_to_tb_tensor(img: Image.Image) -> torch.Tensor:
@@ -123,22 +198,78 @@ def pil_to_tb_tensor(img: Image.Image) -> torch.Tensor:
     return torch.from_numpy(arr).permute(2, 0, 1)  # [C, H, W]
 
 
+def composite_overlay(cond_pil: Image.Image, pred_pil: Image.Image, alpha: float = 0.5) -> Image.Image:
+    """Overlay prediction on EM input for visual comparison.
+
+    Colored (non-gray) pixels from pred are blended onto the EM image.
+    """
+    import numpy as np
+
+    cond = np.array(cond_pil).astype(np.float32)
+    pred = np.array(pred_pil).astype(np.float32)
+
+    # Detect colored pixels: where channels differ significantly
+    max_ch = pred.max(axis=-1)
+    min_ch = pred.min(axis=-1)
+    colored = (max_ch - min_ch) > 30  # saturation threshold
+
+    out = cond.copy()
+    out[colored] = (1 - alpha) * cond[colored] + alpha * pred[colored]
+    return Image.fromarray(out.clip(0, 255).astype(np.uint8))
+
+
+def _build_image_grid(
+    cond_pils: list[Image.Image],
+    target_pils: list[Image.Image],
+    pred_pils: list[Image.Image] | None = None,
+) -> torch.Tensor:
+    """Build a single image grid with rows: EM input, GT overlay, prediction overlay.
+
+    For overlay mode targets already contain the EM background.
+    For segmentation mode targets are on black — we composite them onto the EM.
+    Predictions are always composited onto the EM for easy visual comparison.
+
+    Returns a [C, H, W] tensor suitable for tensorboard.
+    """
+    from torchvision.utils import make_grid
+
+    n = len(cond_pils)
+    rows: list[torch.Tensor] = []
+
+    # Row 1: raw EM input
+    for img in cond_pils:
+        rows.append(pil_to_tb_tensor(img))
+
+    # Row 2: ground truth overlaid on EM
+    for cond, target in zip(cond_pils, target_pils):
+        overlay = composite_overlay(cond, target, alpha=0.7)
+        rows.append(pil_to_tb_tensor(overlay))
+
+    # Row 3: prediction overlaid on EM (if provided)
+    if pred_pils is not None:
+        for cond, pred in zip(cond_pils, pred_pils):
+            overlay = composite_overlay(cond, pred, alpha=0.7)
+            rows.append(pil_to_tb_tensor(overlay))
+
+    # nrow=n means each "row" of n images stacks vertically
+    return make_grid(rows, nrow=n, padding=4)
+
+
 def run_validation(
     pipe,
     transformer,
     dataset,
     accelerator,
     global_step: int,
+    target_mode: str = "overlay",
     num_images: int = 4,
     num_inference_steps: int = 28,
     guidance_scale: float = 3.5,
 ):
-    """Run inference on dataset samples and log images to tensorboard.
+    """Run inference on dataset samples and log a single image grid.
 
-    Logs three images per sample: input (raw EM), ground truth (colored),
-    and model prediction.
+    Grid rows: EM input | GT overlay | prediction overlay.
     """
-    import numpy as np
     from torchvision.utils import make_grid
 
     logger.info(f"Running validation at step {global_step}...")
@@ -152,9 +283,9 @@ def run_validation(
     # Ensure VAE is explicitly in bf16 (accelerate may have moved it)
     pipe.vae.to(dtype=torch.bfloat16)
 
-    cond_imgs = []
-    gt_imgs = []
-    pred_imgs = []
+    cond_pils = []
+    gt_pils = []
+    pred_pils = []
 
     generator = torch.Generator(device=accelerator.device).manual_seed(42)
 
@@ -174,27 +305,20 @@ def run_validation(
                 generator=generator,
             ).images[0]
 
-        cond_imgs.append(pil_to_tb_tensor(cond_pil))
-        gt_imgs.append(pil_to_tb_tensor(target_pil))
-        pred_imgs.append(pil_to_tb_tensor(result))
+        cond_pils.append(cond_pil)
+        gt_pils.append(target_pil)
+        pred_pils.append(result)
 
-    if cond_imgs:
+    if cond_pils:
         tracker = accelerator.get_tracker("tensorboard")
         if tracker is not None:
             writer = tracker.writer
-
-            # Log as grids: each row is one sample
-            cond_grid = make_grid(cond_imgs, nrow=len(cond_imgs), padding=4)
-            gt_grid = make_grid(gt_imgs, nrow=len(gt_imgs), padding=4)
-            pred_grid = make_grid(pred_imgs, nrow=len(pred_imgs), padding=4)
-
-            writer.add_image("val/input", cond_grid, global_step)
-            writer.add_image("val/ground_truth", gt_grid, global_step)
-            writer.add_image("val/prediction", pred_grid, global_step)
+            grid = _build_image_grid(cond_pils, gt_pils, pred_pils)
+            writer.add_image("val/samples", grid, global_step)
             writer.flush()
 
     unwrapped.train()
-    logger.info(f"Validation complete: logged {len(cond_imgs)} samples")
+    logger.info(f"Validation complete: logged {len(cond_pils)} samples")
 
 
 def compute_flow_matching_loss(
@@ -298,7 +422,7 @@ def train(config_path: str, resume_from: str | None = None):
     vae.requires_grad_(False)
     if pipe.text_encoder is not None:
         pipe.text_encoder.requires_grad_(False)
-    if pipe.text_encoder_2 is not None:
+    if hasattr(pipe, "text_encoder_2") and pipe.text_encoder_2 is not None:
         pipe.text_encoder_2.requires_grad_(False)
     transformer.requires_grad_(False)
 
@@ -307,7 +431,8 @@ def train(config_path: str, resume_from: str | None = None):
     lora_rank = lora_cfg.get("rank", 16)
     lora_alpha = lora_cfg.get("alpha", 16)
     lora_dropout = lora_cfg.get("dropout", 0.0)
-    target_modules = lora_cfg.get("target_modules") or DEFAULT_TARGET_MODULES
+    default_modules = DEFAULT_TARGET_MODULES_FLUX2 if "FLUX.2" in pretrained else DEFAULT_TARGET_MODULES
+    target_modules = lora_cfg.get("target_modules") or default_modules
 
     lora_config = LoraConfig(
         r=lora_rank,
@@ -327,7 +452,7 @@ def train(config_path: str, resume_from: str | None = None):
     vae.to(device, dtype=dtype)
     if pipe.text_encoder is not None:
         pipe.text_encoder.to(device)
-    if pipe.text_encoder_2 is not None:
+    if hasattr(pipe, "text_encoder_2") and pipe.text_encoder_2 is not None:
         pipe.text_encoder_2.to(device)
 
     # Create dataset
@@ -343,6 +468,12 @@ def train(config_path: str, resume_from: str | None = None):
         include_datasets=data_cfg.get("include_datasets"),
         cache_dir=data_cfg.get("cache_dir"),
         seed=train_cfg.get("seed", 42),
+        target_mode=data_cfg.get("target_mode", "overlay"),
+        include_resolution=data_cfg.get("include_resolution", False),
+        auto_norms=data_cfg.get("auto_norms", False),
+        auto_norms_per_image=data_cfg.get("auto_norms_per_image", False),
+        auto_norms_percentile_low=data_cfg.get("auto_norms_percentile_low", 1.0),
+        auto_norms_percentile_high=data_cfg.get("auto_norms_percentile_high", 99.0),
     )
 
     dataloader = DataLoader(
@@ -421,6 +552,9 @@ def train(config_path: str, resume_from: str | None = None):
     latent_h = 1024 // vae_scale_factor
     latent_w = 1024 // vae_scale_factor
     num_channels_latents = vae.config.latent_channels  # 16
+    # After packing, spatial dims are halved (Flux1/Kontext and Flux2 both)
+    packed_h = latent_h // 2
+    packed_w = latent_w // 2
 
     # Training loop
     global_step = 0
@@ -431,11 +565,20 @@ def train(config_path: str, resume_from: str | None = None):
     if not isinstance(train_image_log_steps, (int, float)) or not train_image_log_steps:
         train_image_log_steps = None
 
-    # Check if Kontext model (needs conditioning image latents)
+    # Check model type for conditioning strategy
     is_kontext = "Kontext" in pretrained
+    is_flux2 = "FLUX.2" in pretrained
+    flux2_conditioning = train_cfg.get("flux2_conditioning", "noise_endpoint")
+    flux2_noise_mix = train_cfg.get("flux2_noise_mix", 0.5)
+    # Whether to concatenate conditioning (Kontext always, Flux2 optionally)
+    use_concat_cond = is_kontext or (is_flux2 and flux2_conditioning == "concatenate")
+    # Whether to use EM as noise endpoint (Flux2 noise_endpoint mode)
+    use_noise_endpoint = is_flux2 and flux2_conditioning == "noise_endpoint"
 
     logger.info(f"Starting training for {max_train_steps} steps")
-    logger.info(f"Model: {pretrained} (kontext={is_kontext})")
+    logger.info(f"Model: {pretrained} (kontext={is_kontext}, flux2={is_flux2})")
+    if is_flux2:
+        logger.info(f"Flux2 conditioning: {flux2_conditioning}, noise_mix: {flux2_noise_mix}")
     logger.info(f"LoRA rank={lora_rank}, alpha={lora_alpha}")
 
     num_epochs = math.ceil(max_train_steps / len(dataloader))
@@ -461,38 +604,43 @@ def train(config_path: str, resume_from: str | None = None):
                 target_tensor = pil_to_tensor(target_images, device, dtype)
 
                 with torch.no_grad():
-                    target_latents = encode_images(vae, target_tensor)
-                    if is_kontext:
-                        cond_latents = encode_images(vae, cond_tensor)
+                    target_latents = encode_images(vae, target_tensor, is_flux2=is_flux2)
+                    if use_concat_cond or use_noise_endpoint:
+                        cond_latents = encode_images(vae, cond_tensor, is_flux2=is_flux2)
 
                 # Pack latents to sequence format
-                target_packed = pack_latents(target_latents)
+                target_packed = pack_latents(target_latents, is_flux2=is_flux2)
                 batch_size = target_packed.shape[0]
 
-                if is_kontext:
-                    cond_packed = pack_latents(cond_latents)
+                if use_concat_cond or use_noise_endpoint:
+                    cond_packed = pack_latents(cond_latents, is_flux2=is_flux2)
 
-                # Prepare IDs (2D tensors: [N, 3])
+                # Prepare IDs
                 latent_ids = prepare_latent_image_ids(
-                    latent_h // 2, latent_w // 2, device, dtype
+                    packed_h, packed_w, device, dtype,
+                    is_flux2=is_flux2, batch_size=batch_size,
                 )
 
-                if is_kontext:
-                    image_ids = prepare_latent_image_ids(
-                        latent_h // 2, latent_w // 2, device, dtype
-                    )
-                    image_ids[..., 0] = 1  # Mark as conditioning
-                    # Concatenate IDs: main + conditioning
-                    all_ids = torch.cat(
-                        [latent_ids, image_ids], dim=0
-                    )
+                if use_concat_cond:
+                    if is_flux2:
+                        image_ids = prepare_flux2_cond_ids(
+                            packed_h, packed_w, device, dtype,
+                            batch_size=batch_size,
+                        )
+                        all_ids = torch.cat([latent_ids, image_ids], dim=1)
+                    else:
+                        image_ids = prepare_latent_image_ids(
+                            packed_h, packed_w, device, dtype,
+                        )
+                        image_ids[..., 0] = 1  # Mark as conditioning
+                        all_ids = torch.cat([latent_ids, image_ids], dim=0)
                 else:
                     all_ids = latent_ids
 
                 # Encode text
                 with torch.no_grad():
                     prompt_embeds, pooled_prompt_embeds, text_ids = encode_prompt(
-                        pipe, prompts, device, dtype
+                        pipe, prompts, device, dtype, is_flux2=is_flux2,
                     )
 
                 # Sample random timesteps (flow matching: sigma in [0, 1])
@@ -501,12 +649,20 @@ def train(config_path: str, resume_from: str | None = None):
                 sigmas = torch.sigmoid(u)  # logit-normal -> [0, 1]
                 sigmas = sigmas.view(-1, 1, 1)
 
-                # Create noisy latents: x_t = (1 - sigma) * clean + sigma * noise
+                # Create noisy latents
                 noise = torch.randn_like(target_packed)
-                noisy_latents = (1 - sigmas) * target_packed + sigmas * noise
+                if use_noise_endpoint:
+                    # Flux2 noise_endpoint: blend EM latents with noise as the
+                    # flow endpoint, matching img2img inference where the EM
+                    # image is the starting point.
+                    endpoint = (1 - flux2_noise_mix) * cond_packed + flux2_noise_mix * noise
+                    noisy_latents = (1 - sigmas) * target_packed + sigmas * endpoint
+                else:
+                    # Standard: x_t = (1 - sigma) * clean + sigma * noise
+                    noisy_latents = (1 - sigmas) * target_packed + sigmas * noise
 
-                # Concatenate conditioning for Kontext
-                if is_kontext:
+                # Concatenate conditioning for Kontext / Flux2-concatenate mode
+                if use_concat_cond:
                     hidden_states = torch.cat(
                         [noisy_latents, cond_packed], dim=1
                     )
@@ -520,31 +676,36 @@ def train(config_path: str, resume_from: str | None = None):
 
                 # Guidance embedding
                 guidance = None
-                if transformer.module.config.guidance_embeds if hasattr(transformer, 'module') else transformer.config.guidance_embeds:
+                t_config = transformer.module.config if hasattr(transformer, 'module') else transformer.config
+                has_guidance = getattr(t_config, 'guidance_embeds', False) or is_flux2
+                if has_guidance:
                     guidance_scale = train_cfg.get("guidance_scale", 3.5)
                     guidance = torch.full(
                         [batch_size], guidance_scale, device=device, dtype=torch.float32
                     )
 
                 # Forward pass
-                model_output = transformer(
+                fwd_kwargs = dict(
                     hidden_states=hidden_states,
                     timestep=timestep / 1000,
                     guidance=guidance,
-                    pooled_projections=pooled_prompt_embeds,
                     encoder_hidden_states=prompt_embeds,
                     txt_ids=text_ids,
                     img_ids=all_ids,
                     return_dict=False,
-                )[0]
+                )
+                if not is_flux2:
+                    fwd_kwargs["pooled_projections"] = pooled_prompt_embeds
+                model_output = transformer(**fwd_kwargs)[0]
 
                 # Only take predictions for the main latents (not conditioning)
                 model_pred = model_output[:, : target_packed.shape[1]]
 
-                # Compute loss
+                # Compute loss (endpoint is the "noise" side of the flow)
+                flow_endpoint = endpoint if use_noise_endpoint else noise
                 loss = compute_flow_matching_loss(
                     model_pred,
-                    noise,
+                    flow_endpoint,
                     target_packed,
                     sigmas.squeeze(-1).squeeze(-1),
                     weighting_scheme=weighting_scheme,
@@ -573,22 +734,14 @@ def train(config_path: str, resume_from: str | None = None):
 
                 # Log training images periodically
                 if train_image_log_steps is not None and global_step % train_image_log_steps == 0:
-                    from torchvision.utils import make_grid
-
                     tracker = accelerator.get_tracker("tensorboard")
                     if tracker is not None:
                         writer = tracker.writer
                         n = min(4, len(cond_images))
-                        cond_grid = make_grid(
-                            [pil_to_tb_tensor(img) for img in cond_images[:n]],
-                            nrow=n, padding=4,
+                        grid = _build_image_grid(
+                            cond_images[:n], target_images[:n],
                         )
-                        target_grid = make_grid(
-                            [pil_to_tb_tensor(img) for img in target_images[:n]],
-                            nrow=n, padding=4,
-                        )
-                        writer.add_image("train/input", cond_grid, global_step)
-                        writer.add_image("train/target", target_grid, global_step)
+                        writer.add_image("train/samples", grid, global_step)
                         writer.flush()
 
             # Checkpointing
@@ -620,6 +773,7 @@ def train(config_path: str, resume_from: str | None = None):
                     dataset=dataset,
                     accelerator=accelerator,
                     global_step=global_step,
+                    target_mode=data_cfg.get("target_mode", "overlay"),
                     num_images=num_val_images,
                     num_inference_steps=train_cfg.get("num_steps", 28),
                     guidance_scale=train_cfg.get("guidance_scale", 3.5),
