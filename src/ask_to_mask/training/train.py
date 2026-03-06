@@ -474,6 +474,9 @@ def train(config_path: str, resume_from: str | None = None):
         auto_norms_per_image=data_cfg.get("auto_norms_per_image", False),
         auto_norms_percentile_low=data_cfg.get("auto_norms_percentile_low", 1.0),
         auto_norms_percentile_high=data_cfg.get("auto_norms_percentile_high", 99.0),
+        multi_organelle_prob=data_cfg.get("multi_organelle_prob", 0.0),
+        negative_example_prob=data_cfg.get("negative_example_prob", 0.0),
+        prompt_variation=data_cfg.get("prompt_variation", False),
     )
 
     dataloader = DataLoader(
