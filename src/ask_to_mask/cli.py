@@ -131,16 +131,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Organelle class to segment.",
     )
     ref.add_argument(
-        "--gen-backend", default="flux", help="Image generation backend (default: flux)."
+        "--gen-backend", default="flux", choices=["flux", "gemini"],
+        help="Image generation backend (default: flux)."
     )
     ref.add_argument(
         "--model",
         default=DEFAULT_MODEL,
-        choices=list(MODELS.keys()),
-        help=f"Flux model to use (default: {DEFAULT_MODEL}).",
+        help=f"Model to use. For flux: {list(MODELS.keys())}. For gemini: any image-capable model name.",
     )
     ref.add_argument("--lora", type=str, default=None, help="Path to LoRA weights.")
     ref.add_argument("--device", default="cuda", help="Torch device (default: cuda).")
+    ref.add_argument(
+        "--gcp-project", default=None,
+        help="GCP project ID for Vertex AI (required for Imagen models).",
+    )
     ref.add_argument(
         "--llm-provider",
         default="ollama",
@@ -256,6 +260,7 @@ def cmd_refine(args: argparse.Namespace) -> None:
         lora_path=args.lora,
         device=args.device,
         organelle_rgb=organelle.rgb,
+        gcp_project=getattr(args, "gcp_project", None),
     )
 
     em_image = load_em_image(args.input)
@@ -277,7 +282,10 @@ def cmd_refine(args: argparse.Namespace) -> None:
     )
 
     print(f"Refining {organelle.name} segmentation on {args.input.name}")
-    print(f"  Gen backend: {args.gen_backend} ({args.model})")
+    if args.gen_backend == "flux":
+        print(f"  Gen backend: flux ({args.model})")
+    else:
+        print(f"  Gen backend: {args.gen_backend}")
     print(f"  LLM provider: {args.llm_provider}")
     print(f"  Max iterations: {args.max_iterations}, min score: {args.min_score}")
 
