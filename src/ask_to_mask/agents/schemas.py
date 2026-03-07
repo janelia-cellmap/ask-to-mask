@@ -34,10 +34,22 @@ class GenerationResult:
 
 
 @dataclass
+class DetailedScores:
+    """Detailed evaluation sub-scores from the VLM."""
+
+    tp_rate: float  # 0-1: fraction of real organelles correctly colored
+    fp_rate: float  # 0-1: fraction of colored area that is NOT organelle (false positives)
+    fn_rate: float  # 0-1: fraction of real organelles that were missed
+    boundary_quality: float  # 0-1: how tight/precise the boundaries are
+    dice_score: float  # 0-1: estimated overall overlap (2*TP / (2*TP + FP + FN))
+
+
+@dataclass
 class EvaluationResult:
     """Combined critique + refinement output from the evaluator agent."""
 
     score: float  # 0.0 to 1.0
+    detailed_scores: DetailedScores | None
     issues: list[str]
     refined_prompt: str | None
     param_adjustments: dict[str, float]

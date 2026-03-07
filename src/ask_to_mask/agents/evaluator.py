@@ -9,35 +9,36 @@ from PIL import Image
 
 from ..config import OrganelleClass
 from .llm_backend import LLMBackend, images_to_composite
-from .schemas import EvaluationResult, GenerationParams, GenerationResult
+from .schemas import (
+    DetailedScores,
+    EvaluationResult,
+    GenerationParams,
+    GenerationResult,
+)
 
 SYSTEM_PROMPT = """\
 You evaluate EM image colorization. You see two panels: LEFT=original EM, RIGHT=colored output.
 
-Compare LEFT and RIGHT carefully. The colored regions in RIGHT must correspond to where the target organelle actually appears in LEFT. If something is colored that doesn't match the organelle's appearance in the EM, that's a false positive.
+Compare LEFT and RIGHT carefully:
+1. Count how many organelles are CORRECTLY colored in RIGHT vs how many are visible in LEFT
+2. Check if NON-organelle areas are colored (false positives / background bleed)
+3. Check if the coloring is precise (tight boundaries) or sloppy (bleeds into surroundings)
 
-The goal: ONLY the target organelle should be brightly colored. The background and other structures must stay grayscale/unchanged.
+You MUST provide detailed sub-scores (all 0.0 to 1.0):
+- tp_rate: fraction of real organelles that are correctly colored (1.0 = all colored)
+- fp_rate: fraction of colored pixels that are on NON-organelle areas (0.0 = no false positives, 1.0 = all colored area is wrong)
+- fn_rate: fraction of real organelles that were MISSED / not colored (0.0 = none missed, 1.0 = all missed)
+- boundary_quality: how precise/tight the coloring boundaries are (1.0 = pixel-perfect, 0.0 = very sloppy bleed)
+- dice_score: estimated overall quality = 2*TP / (2*TP + FP + FN). This is your best estimate of segmentation overlap.
 
-Be VERY HARSH:
-- 0.0-0.2: entire image is tinted/colored (WORST failure — means everything is colored, not just the organelle)
-- 0.2-0.4: organelle not colored, or wrong structures colored, or massive background coloring
-- 0.4-0.6: some organelle colored but significant problems (many missed, heavy background color, uneven)
-- 0.6-0.75: decent — most organelles colored, moderate background bleed
-- 0.75-0.85: good — organelles well colored with only minor issues
-- 0.85-1.0: excellent (RARE) — all organelles brightly colored, background stays gray
+The "score" field should equal the dice_score.
 
-CRITICAL: If the background/non-organelle areas are visibly colored, that is a MAJOR problem. Score below 0.4 if most of the image is tinted.
+When score < 0.85, suggest a refined_prompt (up to 75 words, end with "Keep everything else unchanged.").
 
-When score < 0.85, you MUST change BOTH:
-- refined_prompt: Write a DIFFERENT prompt. If background is colored, try "ONLY color the {organelle}" or "Do not color the background". If organelles are missed, describe their shape/location.
-- param_adjustments: Change at least one. guidance_scale (3.5-30, higher=follows prompt more). strength (0.5-1.0, lower=less change to image). num_inference_steps (20-50, higher=more detail).
-
-If the whole image is tinted: LOWER strength significantly (try 0.3-0.55) and RAISE guidance_scale (try 15-25). If still tinted after lowering, keep lowering strength.
-
-Keep prompts under 50 words. Include "Color all the {organelle} in {color}." End with "Keep everything else unchanged."
+DO NOT suggest param_adjustments — the loop controls parameters automatically. Set param_adjustments to {}.
 
 Respond with ONLY JSON:
-{"score": 0.0-1.0, "issues": ["specific issue"], "refined_prompt": "new different prompt", "param_adjustments": {"guidance_scale": 15.0, "strength": 0.5, "num_inference_steps": 28}, "should_stop": false, "reasoning": "brief reason"}\
+{"score": 0.0-1.0, "detailed_scores": {"tp_rate": 0.8, "fp_rate": 0.1, "fn_rate": 0.2, "boundary_quality": 0.7, "dice_score": 0.6}, "issues": ["specific issue"], "refined_prompt": "new prompt", "param_adjustments": {}, "should_stop": false, "reasoning": "brief reason"}\
 """
 
 
@@ -120,14 +121,30 @@ class EvaluatorAgent:
         if history:
             parts.append("\nPrevious attempts:")
             for i, (params, eval_result) in enumerate(history):
+                scores_str = ""
+                if eval_result.detailed_scores:
+                    ds = eval_result.detailed_scores
+                    scores_str = (
+                        f"tp={ds.tp_rate:.2f} fp={ds.fp_rate:.2f} "
+                        f"fn={ds.fn_rate:.2f} boundary={ds.boundary_quality:.2f} "
+                        f"dice={ds.dice_score:.2f}"
+                    )
+                else:
+                    scores_str = f"score={eval_result.score:.2f}"
                 parts.append(
-                    f"  #{i+1}: score={eval_result.score:.2f}, "
+                    f"  #{i+1}: {scores_str}, "
                     f"prompt=\"{params.prompt}\", "
                     f"strength={params.strength}, "
                     f"guidance={params.guidance_scale}, "
                     f"issues={eval_result.issues}"
                 )
-            parts.append("Do NOT repeat prompts or params that scored poorly. Try something different.")
+            best = max(history, key=lambda h: h[1].score)
+            parts.append(
+                f"\nBEST so far: #{history.index(best)+1} with score={best[1].score:.2f}, "
+                f"prompt=\"{best[0].prompt}\", strength={best[0].strength}, "
+                f"guidance={best[0].guidance_scale}"
+            )
+            parts.append("Build on what worked best. Do NOT repeat prompts that scored poorly.")
 
         parts.append("\nRespond with JSON only.")
         return "\n".join(parts)
@@ -159,12 +176,25 @@ class EvaluatorAgent:
         if parsed is None:
             return EvaluationResult(
                 score=0.5,
+                detailed_scores=None,
                 issues=["Could not parse VLM response"],
                 refined_prompt=None,
                 param_adjustments={},
                 should_stop=False,
                 reasoning="Parse failure — using defaults",
                 raw_response=raw[:2000],
+            )
+
+        # Parse detailed_scores
+        detailed = None
+        ds = parsed.get("detailed_scores", {})
+        if isinstance(ds, dict) and "tp_rate" in ds:
+            detailed = DetailedScores(
+                tp_rate=float(ds.get("tp_rate", 0.5)),
+                fp_rate=float(ds.get("fp_rate", 0.5)),
+                fn_rate=float(ds.get("fn_rate", 0.5)),
+                boundary_quality=float(ds.get("boundary_quality", 0.5)),
+                dice_score=float(ds.get("dice_score", 0.5)),
             )
 
         # Filter out null values from param_adjustments
@@ -174,8 +204,14 @@ class EvaluatorAgent:
         else:
             param_adj = {}
 
+        score = float(parsed.get("score", 0.5))
+        # Use dice_score as the canonical score if available
+        if detailed:
+            score = detailed.dice_score
+
         return EvaluationResult(
-            score=float(parsed.get("score", 0.5)),
+            score=score,
+            detailed_scores=detailed,
             issues=parsed.get("issues", []),
             refined_prompt=parsed.get("refined_prompt"),
             param_adjustments=param_adj,
@@ -197,6 +233,15 @@ class EvaluatorAgent:
         score_match = re.search(r'"score"\s*:\s*([\d.]+)', text)
         if score_match:
             result["score"] = float(score_match.group(1))
+
+        # Extract detailed_scores sub-fields
+        ds = {}
+        for field in ("tp_rate", "fp_rate", "fn_rate", "boundary_quality", "dice_score"):
+            m = re.search(rf'"{field}"\s*:\s*([\d.]+)', text)
+            if m:
+                ds[field] = float(m.group(1))
+        if ds:
+            result["detailed_scores"] = ds
 
         # Extract issues array (try to get completed items)
         issues_match = re.search(r'"issues"\s*:\s*\[([^\]]*)\]', text)
@@ -221,7 +266,7 @@ class EvaluatorAgent:
         if reason_match:
             result["reasoning"] = reason_match.group(1)
 
-        # Extract guidance_scale and strength from param_adjustments
+        # Extract param_adjustments
         param_adj = {}
         for param in ("guidance_scale", "strength", "threshold", "num_inference_steps"):
             m = re.search(rf'"{param}"\s*:\s*([\d.]+)', text)

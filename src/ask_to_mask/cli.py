@@ -281,13 +281,25 @@ def cmd_refine(args: argparse.Namespace) -> None:
         save_intermediates=args.save_intermediates,
     )
 
+    # Build output subdirectory: gen_model_eval_model/datetime
+    from datetime import datetime
+
+    if args.gen_backend == "flux":
+        gen_model_name = args.model
+    else:
+        gen_model_name = getattr(gen_backend, "model", args.gen_backend)
+    eval_model_name = getattr(llm_backend, "model", args.llm_provider)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = args.output_dir / f"{gen_model_name}_{eval_model_name}" / timestamp
+
     print(f"Refining {organelle.name} segmentation on {args.input.name}")
     if args.gen_backend == "flux":
         print(f"  Gen backend: flux ({args.model})")
     else:
-        print(f"  Gen backend: {args.gen_backend}")
-    print(f"  LLM provider: {args.llm_provider}")
+        print(f"  Gen backend: {args.gen_backend} ({gen_model_name})")
+    print(f"  Evaluator: {args.llm_provider} ({eval_model_name})")
     print(f"  Max iterations: {args.max_iterations}, min score: {args.min_score}")
+    print(f"  Output: {run_dir}")
 
     result = run_refinement_loop(
         gen_backend=gen_backend,
@@ -296,12 +308,24 @@ def cmd_refine(args: argparse.Namespace) -> None:
         organelle=organelle,
         initial_params=initial_params,
         config=config,
-        output_dir=args.output_dir,
+        output_dir=run_dir,
     )
 
-    status = "converged" if result.converged else "max iterations reached"
+    if result.converged:
+        status = "converged"
+    elif result.plateau:
+        status = "score plateau"
+    else:
+        status = "max iterations reached"
     print(f"\n=== Done ({status}) ===")
-    print(f"  Best score: {result.best_evaluation.score:.2f}")
+    print(f"  Best score: {result.best_evaluation.score:.3f}")
+    if result.best_evaluation.detailed_scores:
+        ds = result.best_evaluation.detailed_scores
+        print(
+            f"  Details: tp_rate={ds.tp_rate:.2f}  fp_rate={ds.fp_rate:.2f}  "
+            f"fn_rate={ds.fn_rate:.2f}  boundary={ds.boundary_quality:.2f}  "
+            f"dice={ds.dice_score:.3f}"
+        )
     print(f"  Total iterations: {result.total_iterations}")
     if args.save_intermediates:
         print(f"  Results saved to: {args.output_dir}")

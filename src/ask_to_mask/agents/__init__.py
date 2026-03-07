@@ -3,7 +3,7 @@
 from .gen_backend import ImageGenBackend, FluxBackend, GeminiImageBackend, create_gen_backend
 from .llm_backend import LLMBackend, create_llm_backend
 from .loop import LoopConfig, LoopResult, run_refinement_loop
-from .schemas import GenerationParams, GenerationResult, EvaluationResult
+from .schemas import DetailedScores, GenerationParams, GenerationResult, EvaluationResult
 
 __all__ = [
     "ImageGenBackend",
@@ -15,6 +15,7 @@ __all__ = [
     "LoopConfig",
     "LoopResult",
     "run_refinement_loop",
+    "DetailedScores",
     "GenerationParams",
     "GenerationResult",
     "EvaluationResult",
