@@ -147,20 +147,34 @@ def run_refinement_loop(
 
         # Step 1: Generate
         try:
-            result = gen_backend.generate(em_image, current_params, iteration, instance=instance, mask_mode=mask_mode)
+            result = gen_backend.generate(
+                em_image,
+                current_params,
+                iteration,
+                instance=instance,
+                mask_mode=mask_mode,
+            )
         except Exception as e:
             print(f"  Generation failed: {e}")
             # Save params so we know what was attempted
             if config.save_intermediates and output_dir:
                 iter_dir = output_dir / f"iteration_{iteration:02d}"
                 iter_dir.mkdir(parents=True, exist_ok=True)
-                _save_evaluation(output_dir, iteration,
-                                 EvaluationResult(score=0.0, detailed_scores=None,
-                                                  issues=[f"Generation failed: {e}"],
-                                                  refined_prompt=None, param_adjustments={},
-                                                  should_stop=False, reasoning="generation error",
-                                                  raw_response=""),
-                                 current_params)
+                _save_evaluation(
+                    output_dir,
+                    iteration,
+                    EvaluationResult(
+                        score=0.0,
+                        detailed_scores=None,
+                        issues=[f"Generation failed: {e}"],
+                        refined_prompt=None,
+                        param_adjustments={},
+                        should_stop=False,
+                        reasoning="generation error",
+                        raw_response="",
+                    ),
+                    current_params,
+                )
             continue
         all_results.append(result)
 
@@ -169,9 +183,7 @@ def run_refinement_loop(
             _save_iteration(output_dir, iteration, result, em_image)
 
         # Step 2: Evaluate
-        evaluation = evaluator.evaluate_and_refine(
-            em_image, result, organelle, history
-        )
+        evaluation = evaluator.evaluate_and_refine(em_image, result, organelle, history)
         all_evaluations.append(evaluation)
         history.append((current_params, evaluation))
 
@@ -192,8 +204,13 @@ def run_refinement_loop(
 
         # Save evaluation
         if config.save_intermediates and output_dir:
-            _save_evaluation(output_dir, iteration, evaluation, current_params,
-                             param_effects[-1] if param_effects else None)
+            _save_evaluation(
+                output_dir,
+                iteration,
+                evaluation,
+                current_params,
+                param_effects[-1] if param_effects else None,
+            )
 
         # Step 3: Check if good enough
         if evaluation.score >= config.min_acceptable_score:
@@ -230,7 +247,9 @@ def run_refinement_loop(
             param_name = param_names[param_index]
             direction = 1
             tried_increase = True
-            next_params = _step_param(next_params, param_name, direction, tunable_params)
+            next_params = _step_param(
+                next_params, param_name, direction, tunable_params
+            )
             effect = {
                 "changed_param": param_name,
                 "direction": "+5%",
@@ -238,8 +257,10 @@ def run_refinement_loop(
                 "new_value": _get_param(next_params, param_name),
             }
             param_effects.append(effect)
-            print(f"  Next: {param_name} +5% "
-                  f"({effect['old_value']:.3f} -> {effect['new_value']:.3f})")
+            print(
+                f"  Next: {param_name} +5% "
+                f"({effect['old_value']:.3f} -> {effect['new_value']:.3f})"
+            )
             current_params = next_params
             continue
 
@@ -260,15 +281,21 @@ def run_refinement_loop(
             tried_increase = False
         elif tried_increase:
             print(f"  {param_name} +5% didn't help ({score_delta:+.3f}), trying -5%")
-            current_params = _revert_param(current_params, param_name, param_effects[-1])
+            current_params = _revert_param(
+                current_params, param_name, param_effects[-1]
+            )
             next_params = _copy_params(current_params)
             if evaluation.refined_prompt:
                 next_params = _with_prompt(next_params, evaluation.refined_prompt)
             direction = -1
             tried_increase = False
         else:
-            print(f"  {param_name} -5% didn't help ({score_delta:+.3f}), reverting and moving on")
-            current_params = _revert_param(current_params, param_name, param_effects[-1])
+            print(
+                f"  {param_name} -5% didn't help ({score_delta:+.3f}), reverting and moving on"
+            )
+            current_params = _revert_param(
+                current_params, param_name, param_effects[-1]
+            )
             next_params = _copy_params(current_params)
             if evaluation.refined_prompt:
                 next_params = _with_prompt(next_params, evaluation.refined_prompt)
@@ -278,7 +305,9 @@ def run_refinement_loop(
 
         # If score dropped significantly from best, revert to best params
         if evaluation.score < best_score - 0.1:
-            print(f"  Score dropped significantly (best was {best_score:.3f}) — reverting to best params")
+            print(
+                f"  Score dropped significantly (best was {best_score:.3f}) — reverting to best params"
+            )
             next_params = _copy_params(best_params)
             if evaluation.refined_prompt:
                 next_params = _with_prompt(next_params, evaluation.refined_prompt)
@@ -295,8 +324,10 @@ def run_refinement_loop(
             "new_value": _get_param(next_params, param_name),
         }
         param_effects.append(effect)
-        print(f"  Next: {param_name} {effect['direction']} "
-              f"({effect['old_value']:.3f} -> {effect['new_value']:.3f})")
+        print(
+            f"  Next: {param_name} {effect['direction']} "
+            f"({effect['old_value']:.3f} -> {effect['new_value']:.3f})"
+        )
 
         # Vary seed across iterations
         if next_params.seed is not None:
@@ -330,7 +361,9 @@ def _get_param(params: GenerationParams, name: str) -> float:
 
 
 def _step_param(
-    params: GenerationParams, name: str, direction: int,
+    params: GenerationParams,
+    name: str,
+    direction: int,
     tunable: dict[str, tuple[float, float]] | None = None,
 ) -> GenerationParams:
     """Change one parameter by ±5%, clamped to allowed range."""
@@ -390,7 +423,9 @@ def _copy_params(params: GenerationParams) -> GenerationParams:
     )
 
 
-def _revert_param(params: GenerationParams, name: str, effect: dict) -> GenerationParams:
+def _revert_param(
+    params: GenerationParams, name: str, effect: dict
+) -> GenerationParams:
     """Revert a parameter to its value before the last change."""
     return _with_param(params, name, effect["old_value"])
 

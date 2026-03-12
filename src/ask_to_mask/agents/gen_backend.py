@@ -19,8 +19,12 @@ class ImageGenBackend(ABC):
 
     @abstractmethod
     def generate(
-        self, image: Image.Image, params: GenerationParams, iteration: int = 0,
-        instance: bool = False, mask_mode: str = "overlay",
+        self,
+        image: Image.Image,
+        params: GenerationParams,
+        iteration: int = 0,
+        instance: bool = False,
+        mask_mode: str = "overlay",
     ) -> GenerationResult:
         """Generate a colored image from an EM input + prompt, then extract a mask."""
         ...
@@ -35,7 +39,12 @@ class ImageGenBackend(ABC):
         mask_mode: str,
     ) -> tuple[np.ndarray, Image.Image]:
         """Extract mask from generated image using the appropriate mode."""
-        from ..postprocess import extract_direct_mask, extract_instance_mask, extract_invert_mask, extract_mask
+        from ..postprocess import (
+            extract_direct_mask,
+            extract_instance_mask,
+            extract_invert_mask,
+            extract_mask,
+        )
 
         if mask_mode == "invert":
             mask = extract_invert_mask(generated_image, brightness_threshold=threshold)
@@ -45,12 +54,17 @@ class ImageGenBackend(ABC):
             mask_image = Image.fromarray(mask, mode="L")
         elif instance:
             mask = extract_instance_mask(
-                input_image, generated_image, saturation_threshold=threshold,
+                input_image,
+                generated_image,
+                saturation_threshold=threshold,
             )
             mask_image = Image.fromarray(mask)
         else:
             mask = extract_mask(
-                input_image, generated_image, organelle_rgb, threshold=threshold,
+                input_image,
+                generated_image,
+                organelle_rgb,
+                threshold=threshold,
             )
             mask_image = Image.fromarray(mask, mode="L")
         return mask, mask_image
@@ -72,8 +86,12 @@ class FluxBackend(ImageGenBackend):
         self.organelle_rgb = organelle_rgb
 
     def generate(
-        self, image: Image.Image, params: GenerationParams, iteration: int = 0,
-        instance: bool = False, mask_mode: str = "overlay",
+        self,
+        image: Image.Image,
+        params: GenerationParams,
+        iteration: int = 0,
+        instance: bool = False,
+        mask_mode: str = "overlay",
     ) -> GenerationResult:
         from ..model import run_inference
         from ..pipeline import TARGET_SIZE, pad_to_square, unpad
@@ -95,8 +113,12 @@ class FluxBackend(ImageGenBackend):
         img_resized_cropped = unpad(img_resized, crop_box, TARGET_SIZE)
 
         mask, mask_image = self._extract_mask(
-            img_resized_cropped, result_cropped, self.organelle_rgb,
-            params.threshold, instance, mask_mode,
+            img_resized_cropped,
+            result_cropped,
+            self.organelle_rgb,
+            params.threshold,
+            instance,
+            mask_mode,
         )
 
         return GenerationResult(
@@ -160,8 +182,12 @@ class GeminiImageBackend(ImageGenBackend):
         return genai.Client()
 
     def generate(
-        self, image: Image.Image, params: GenerationParams, iteration: int = 0,
-        instance: bool = False, mask_mode: str = "overlay",
+        self,
+        image: Image.Image,
+        params: GenerationParams,
+        iteration: int = 0,
+        instance: bool = False,
+        mask_mode: str = "overlay",
     ) -> GenerationResult:
         import time
 
@@ -194,8 +220,12 @@ class GeminiImageBackend(ImageGenBackend):
             generated_image = generated_image.resize(image.size, Image.LANCZOS)
 
         mask, mask_image = self._extract_mask(
-            image.convert("RGB"), generated_image, self.organelle_rgb,
-            params.threshold, instance, mask_mode,
+            image.convert("RGB"),
+            generated_image,
+            self.organelle_rgb,
+            params.threshold,
+            instance,
+            mask_mode,
         )
 
         return GenerationResult(
@@ -206,7 +236,6 @@ class GeminiImageBackend(ImageGenBackend):
             params_used=params,
             iteration=iteration,
         )
-
 
     def _generate_gemini(self, client, image: Image.Image, prompt: str) -> Image.Image:
         """Generate via Gemini's generate_content with image modality."""
@@ -224,9 +253,7 @@ class GeminiImageBackend(ImageGenBackend):
 
         for part in response.candidates[0].content.parts:
             if part.inline_data is not None:
-                return Image.open(
-                    io.BytesIO(part.inline_data.data)
-                ).convert("RGB")
+                return Image.open(io.BytesIO(part.inline_data.data)).convert("RGB")
 
         raise RuntimeError(
             f"Gemini returned no image. Response text: "
@@ -290,8 +317,12 @@ class GLMImageBackend(ImageGenBackend):
         )
 
     def generate(
-        self, image: Image.Image, params: GenerationParams, iteration: int = 0,
-        instance: bool = False, mask_mode: str = "overlay",
+        self,
+        image: Image.Image,
+        params: GenerationParams,
+        iteration: int = 0,
+        instance: bool = False,
+        mask_mode: str = "overlay",
     ) -> GenerationResult:
         # GLM-Image requires dimensions divisible by 32
         target_size = 1024
@@ -306,18 +337,26 @@ class GLMImageBackend(ImageGenBackend):
 
         input_resized = image.resize((gen_w, gen_h), Image.LANCZOS)
 
-        result = self.pipe(
-            prompt=params.prompt,
-            image=[input_resized],
-            height=gen_h,
-            width=gen_w,
-            num_inference_steps=params.num_inference_steps,
-            guidance_scale=params.guidance_scale,
-        ).images[0].convert("RGB")
+        result = (
+            self.pipe(
+                prompt=params.prompt,
+                image=[input_resized],
+                height=gen_h,
+                width=gen_w,
+                num_inference_steps=params.num_inference_steps,
+                guidance_scale=params.guidance_scale,
+            )
+            .images[0]
+            .convert("RGB")
+        )
 
         mask, mask_image = self._extract_mask(
-            input_resized, result, self.organelle_rgb,
-            params.threshold, instance, mask_mode,
+            input_resized,
+            result,
+            self.organelle_rgb,
+            params.threshold,
+            instance,
+            mask_mode,
         )
 
         return GenerationResult(
@@ -351,8 +390,12 @@ class QwenImageEditBackend(ImageGenBackend):
         self.pipe.to(device)
 
     def generate(
-        self, image: Image.Image, params: GenerationParams, iteration: int = 0,
-        instance: bool = False, mask_mode: str = "overlay",
+        self,
+        image: Image.Image,
+        params: GenerationParams,
+        iteration: int = 0,
+        instance: bool = False,
+        mask_mode: str = "overlay",
     ) -> GenerationResult:
         import torch
 
@@ -379,8 +422,12 @@ class QwenImageEditBackend(ImageGenBackend):
             generated_image = generated_image.resize(image.size, Image.LANCZOS)
 
         mask, mask_image = self._extract_mask(
-            image.convert("RGB"), generated_image, self.organelle_rgb,
-            params.threshold, instance, mask_mode,
+            image.convert("RGB"),
+            generated_image,
+            self.organelle_rgb,
+            params.threshold,
+            instance,
+            mask_mode,
         )
 
         return GenerationResult(
