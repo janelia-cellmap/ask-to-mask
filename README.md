@@ -107,12 +107,14 @@ Iteratively improve mask quality using a VLM evaluator agent. Each iteration gen
 ### Setup
 
 ```bash
-# Install agent dependencies (ollama backend)
+# Install agent dependencies (Gemini evaluator backend, default)
+pip install -e '.[agents-google]'
+
+# Or install ollama backend instead
 pip install -e '.[agents]'
 
 # For other LLM providers:
 pip install -e '.[agents-anthropic]'  # Claude
-pip install -e '.[agents-google]'     # Gemini
 pip install -e '.[agents-openai]'     # GPT-4o
 ```
 
@@ -126,8 +128,12 @@ ollama pull llama3.2-vision
 ### Run
 
 ```bash
-# Basic refinement loop with ollama (free, local)
+# Basic refinement loop (default evaluator: Gemini)
 pixi run segment refine --input image.png --output-dir ./refined/ --organelle mito
+
+# Use ollama evaluator instead (free, local)
+pixi run segment refine --input image.png --output-dir ./refined/ --organelle mito \
+  --llm-provider ollama --llm-model gemma3:27b
 
 # Use a different LLM provider
 pixi run segment refine --input image.png --output-dir ./refined/ --organelle mito \
@@ -140,6 +146,15 @@ pixi run segment refine --input image.png --output-dir ./refined/ --organelle mi
 # Use Flux2 with LoRA weights
 pixi run segment refine --input image.png --output-dir ./refined/ --organelle mito \
     --model flux2-dev --lora checkpoints/flux2-lora
+
+# Use Qwen image editing backend
+pixi run segment refine --input image.png --output-dir ./refined/ --organelle mito \
+  --gen-backend qwen --model Qwen/Qwen-Image-Edit-2511
+
+# Qwen with explicit defaults (and you can adjust as needed)
+pixi run segment refine --input image.png --output-dir ./refined/ --organelle mito \
+  --gen-backend qwen --model Qwen/Qwen-Image-Edit-2511 \
+  --num-steps 40 --guidance-scale 1.0 --true-cfg-scale 4.0
 ```
 
 Each iteration saves `colored.png`, `mask.png`, and `evaluation.json` to `iteration_00/`, `iteration_01/`, etc. The loop stops when the evaluator scores the mask above `--min-score` or `--max-iterations` is reached.
@@ -148,8 +163,14 @@ Each iteration saves `colored.png`, `mask.png`, and `evaluation.json` to `iterat
 
 Both the image generation model and the evaluator VLM are pluggable:
 
-- **Image gen backends** (`--gen-backend`): `flux` (default). Extensible to other models.
+- **Image gen backends** (`--gen-backend`): `flux` (default), `gemini`, `glm`, `qwen`.
 - **LLM backends** (`--llm-provider`): `ollama`, `anthropic`, `google`, `openai`.
+
+Qwen backend note: `QwenImageEditPlusPipeline` may require a newer `diffusers` build. If import fails, run:
+
+```bash
+pixi run pip install --upgrade "git+https://github.com/huggingface/diffusers"
+```
 
 ## LoRA finetuning
 
