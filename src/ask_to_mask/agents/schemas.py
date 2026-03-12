@@ -15,7 +15,7 @@ class GenerationParams:
     prompt: str
     num_inference_steps: int = 28
     guidance_scale: float = 3.5
-    strength: float = 0.75
+    strength: float | None = 0.75
     seed: int | None = None
     threshold: float = 30.0
     extra: dict = field(default_factory=dict)

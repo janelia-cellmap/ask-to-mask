@@ -98,6 +98,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Include EM-specific organelle descriptions in the prompt.",
     )
+    seg.add_argument(
+        "--resolution",
+        type=float,
+        default=None,
+        help="Image resolution in nm/px. Included in the prompt to help the model understand scale.",
+    )
     seg.add_argument("--device", default="cuda", help="Torch device (default: cuda).")
     seg.add_argument(
         "--lora",
@@ -122,7 +128,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     ref.add_argument("--input", type=Path, required=True, help="Path to an EM image.")
     ref.add_argument(
-        "--output-dir", type=Path, required=True, help="Directory to save results."
+        "--output-dir", type=Path, default=Path("outputs"), help="Directory to save results."
     )
     ref.add_argument(
         "--organelle",
@@ -131,25 +137,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Organelle class to segment.",
     )
     ref.add_argument(
-        "--gen-backend", default="flux", choices=["flux", "gemini"],
+        "--gen-backend", default="flux", choices=["flux", "gemini", "glm", "qwen"],
         help="Image generation backend (default: flux)."
     )
     ref.add_argument(
         "--model",
         default=DEFAULT_MODEL,
-        help=f"Model to use. For flux: {list(MODELS.keys())}. For gemini: any image-capable model name.",
+        help=f"Model to use. For flux: {list(MODELS.keys())}. For gemini: any image-capable model name. For glm: HF repo ID (default: zai-org/GLM-Image). For qwen: HF repo ID (default: Qwen/Qwen-Image-Edit-2511).",
     )
     ref.add_argument("--lora", type=str, default=None, help="Path to LoRA weights.")
     ref.add_argument("--device", default="cuda", help="Torch device (default: cuda).")
     ref.add_argument(
         "--gcp-project", default=None,
-        help="GCP project ID for Vertex AI (required for Imagen models).",
+        help="GCP project ID for Vertex AI.",
+    )
+    ref.add_argument(
+        "--gcp-location", default="us-central1",
+        help="GCP location for Vertex AI (default: us-central1).",
+    )
+    ref.add_argument(
+        "--vertex-ai", action="store_true",
+        help="Use Vertex AI (service account / ADC) instead of API key.",
     )
     ref.add_argument(
         "--llm-provider",
-        default="ollama",
+        default="google",
         choices=["ollama", "anthropic", "google", "openai"],
-        help="LLM/VLM provider for evaluation (default: ollama).",
+        help="LLM/VLM provider for evaluation (default: google).",
     )
     ref.add_argument("--llm-model", default=None, help="LLM model name.")
     ref.add_argument(
@@ -161,7 +175,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--max-iterations", type=int, default=5, help="Max refinement iterations."
     )
     ref.add_argument(
-        "--min-score", type=float, default=0.8, help="Min acceptable score to stop."
+        "--min-score", type=float, default=0.95, help="Min acceptable score to stop."
     )
     ref.add_argument(
         "--save-intermediates",
@@ -169,11 +183,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=True,
         help="Save each iteration's outputs (default: True).",
     )
-    ref.add_argument("--num-steps", type=int, default=28, help="Inference steps.")
-    ref.add_argument("--guidance-scale", type=float, default=3.5, help="Guidance scale.")
-    ref.add_argument("--strength", type=float, default=0.75, help="Edit strength.")
+    ref.add_argument("--num-steps", type=int, default=28, help="Inference steps (default: 28 for flux/gemini, 50 for glm, 40 for qwen).")
+    ref.add_argument("--guidance-scale", type=float, default=3.5, help="Guidance scale (default: 3.5 for flux/gemini, 1.5 for glm, 1.0 for qwen).")
+    ref.add_argument("--true-cfg-scale", type=float, default=4.0, help="Qwen only: true_cfg_scale (default: 4.0).")
+    ref.add_argument("--strength", type=float, default=0.75, help="Edit strength (flux only).")
     ref.add_argument("--threshold", type=float, default=30.0, help="Mask threshold.")
     ref.add_argument("--seed", type=int, default=None, help="Random seed.")
+    ref.add_argument(
+        "--resolution",
+        type=float,
+        default=None,
+        help="Image resolution in nm/px. Included in the prompt to help the model understand scale.",
+    )
+    ref.add_argument(
+        "--instance",
+        action="store_true",
+        help="Instance segmentation: color each instance a different color.",
+    )
+    ref.add_argument(
+        "--mask-mode",
+        default="overlay",
+        choices=["overlay", "direct", "invert"],
+        help="Mask extraction mode: 'overlay' colors organelles on the EM image; 'direct' asks for white-on-black mask; 'invert' segments background/edges then inverts to get instances (default: overlay).",
+    )
 
     # --- list-organelles ---
     sub.add_parser("list-organelles", help="List available organelle classes.")
@@ -221,6 +253,7 @@ def cmd_segment(args: argparse.Namespace) -> None:
         custom_prompt=args.custom_prompt,
         instance=args.instance,
         detailed_prompt=args.detailed_prompt,
+        resolution_nm=args.resolution,
     )
 
     for path in image_paths:
@@ -250,6 +283,10 @@ def cmd_refine(args: argparse.Namespace) -> None:
         llm_kwargs["model"] = args.llm_model
     if args.llm_provider == "ollama":
         llm_kwargs["host"] = args.ollama_host
+    if args.vertex_ai:
+        llm_kwargs["vertex_ai"] = True
+        llm_kwargs["gcp_project"] = args.gcp_project
+        llm_kwargs["gcp_location"] = args.gcp_location
 
     llm_backend = create_llm_backend(args.llm_provider, **llm_kwargs)
 
@@ -260,20 +297,52 @@ def cmd_refine(args: argparse.Namespace) -> None:
         lora_path=args.lora,
         device=args.device,
         organelle_rgb=organelle.rgb,
-        gcp_project=getattr(args, "gcp_project", None),
+        gcp_project=args.gcp_project,
+        gcp_location=args.gcp_location,
+        vertex_ai=args.vertex_ai,
     )
 
     em_image = load_em_image(args.input)
-    initial_prompt = organelle.build_prompt(detailed=False)
+    instance = getattr(args, "instance", False)
+    mask_mode = getattr(args, "mask_mode", "overlay")
+    resolution_nm = getattr(args, "resolution", None)
+    if mask_mode == "invert":
+        initial_prompt = organelle.build_invert_prompt(detailed=False, resolution_nm=resolution_nm)
+    elif instance:
+        initial_prompt = organelle.build_instance_prompt(detailed=False, direct=(mask_mode == "direct"), resolution_nm=resolution_nm)
+    elif mask_mode == "direct":
+        initial_prompt = organelle.build_direct_prompt(detailed=False, resolution_nm=resolution_nm)
+    else:
+        initial_prompt = organelle.build_prompt(detailed=False, resolution_nm=resolution_nm)
 
-    initial_params = GenerationParams(
-        prompt=initial_prompt,
-        num_inference_steps=args.num_steps,
-        guidance_scale=args.guidance_scale,
-        strength=args.strength,
-        seed=args.seed,
-        threshold=args.threshold,
-    )
+    # Backend-specific defaults
+    BACKEND_DEFAULTS = {
+        "flux": {"num_inference_steps": 28, "guidance_scale": 3.5, "strength": 0.75},
+        "glm": {"num_inference_steps": 50, "guidance_scale": 1.5},
+        "gemini": {"num_inference_steps": 28, "guidance_scale": 3.5},
+        "qwen": {"num_inference_steps": 40, "guidance_scale": 1.0},
+    }
+    defaults = BACKEND_DEFAULTS.get(args.gen_backend, {})
+
+    param_kwargs: dict = {
+        "prompt": initial_prompt,
+        "num_inference_steps": args.num_steps if args.num_steps != 28 else defaults.get("num_inference_steps", 28),
+        "guidance_scale": args.guidance_scale if args.guidance_scale != 3.5 else defaults.get("guidance_scale", 3.5),
+        "seed": args.seed,
+        "threshold": args.threshold,
+        "extra": {},
+    }
+    # Only include strength for backends that use it
+    if "strength" in defaults:
+        param_kwargs["strength"] = args.strength if args.strength != 0.75 else defaults["strength"]
+    else:
+        param_kwargs["strength"] = None
+
+    if args.gen_backend == "qwen":
+        param_kwargs["extra"]["true_cfg_scale"] = args.true_cfg_scale
+        param_kwargs["extra"]["negative_prompt"] = " "
+
+    initial_params = GenerationParams(**param_kwargs)
 
     config = LoopConfig(
         max_iterations=args.max_iterations,
@@ -290,7 +359,7 @@ def cmd_refine(args: argparse.Namespace) -> None:
         gen_model_name = getattr(gen_backend, "model", args.gen_backend)
     eval_model_name = getattr(llm_backend, "model", args.llm_provider)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = args.output_dir / f"{gen_model_name}_{eval_model_name}" / timestamp
+    run_dir = args.output_dir / f"{gen_model_name}_{eval_model_name}" / args.organelle / timestamp
 
     print(f"Refining {organelle.name} segmentation on {args.input.name}")
     if args.gen_backend == "flux":
@@ -309,6 +378,10 @@ def cmd_refine(args: argparse.Namespace) -> None:
         initial_params=initial_params,
         config=config,
         output_dir=run_dir,
+        instance=instance,
+        mask_mode=mask_mode,
+        gen_model=gen_model_name,
+        resolution_nm=resolution_nm,
     )
 
     if result.converged:

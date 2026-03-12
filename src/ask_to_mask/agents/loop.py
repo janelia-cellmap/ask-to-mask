@@ -15,15 +15,46 @@ from .llm_backend import LLMBackend, images_to_composite
 from .schemas import EvaluationResult, GenerationParams, GenerationResult
 
 
-# The tunable numeric parameters and their allowed ranges
-TUNABLE_PARAMS = {
-    "strength": (0.3, 1.0),
-    "guidance_scale": (1.0, 30.0),
-    "num_inference_steps": (15, 50),
+# The tunable numeric parameters and their allowed ranges, per backend
+TUNABLE_PARAMS_BY_BACKEND = {
+    "flux": {
+        "strength": (0.3, 1.0),
+        "guidance_scale": (1.0, 30.0),
+        "num_inference_steps": (15, 50),
+    },
+    "glm": {
+        "guidance_scale": (1.0, 10.0),
+        "num_inference_steps": (20, 100),
+    },
+    "qwen": {
+        "guidance_scale": (0.5, 10.0),
+        "num_inference_steps": (20, 80),
+    },
+    "gemini": {},  # No tunable numeric params
 }
 
 # How much to change a parameter per step (fraction of current value)
 STEP_FRACTION = 0.05
+
+
+def _backend_name(gen_backend: ImageGenBackend) -> str:
+    """Infer the backend key from the class name."""
+    from .gen_backend import (
+        FluxBackend,
+        GeminiImageBackend,
+        GLMImageBackend,
+        QwenImageEditBackend,
+    )
+
+    if isinstance(gen_backend, FluxBackend):
+        return "flux"
+    if isinstance(gen_backend, GLMImageBackend):
+        return "glm"
+    if isinstance(gen_backend, QwenImageEditBackend):
+        return "qwen"
+    if isinstance(gen_backend, GeminiImageBackend):
+        return "gemini"
+    return "flux"
 
 
 @dataclass
@@ -31,7 +62,7 @@ class LoopConfig:
     """Configuration for the refinement loop."""
 
     max_iterations: int = 5
-    min_acceptable_score: float = 0.8
+    min_acceptable_score: float = 0.95
     save_intermediates: bool = True
 
 
@@ -56,6 +87,10 @@ def run_refinement_loop(
     initial_params: GenerationParams,
     config: LoopConfig = LoopConfig(),
     output_dir: Path | None = None,
+    instance: bool = False,
+    mask_mode: str = "overlay",
+    gen_model: str = "",
+    resolution_nm: float | None = None,
 ) -> LoopResult:
     """Run the generate-evaluate-refine loop.
 
@@ -63,15 +98,30 @@ def run_refinement_loop(
     revert if worse. Cycle through params systematically. The evaluator only
     refines the prompt — param tuning is done here.
     """
-    evaluator = EvaluatorAgent(backend=llm_backend)
+    evaluator = EvaluatorAgent(
+        backend=llm_backend,
+        instance=instance,
+        gen_model=gen_model,
+        resolution_nm=resolution_nm,
+    )
+
+    # Use VLM to generate the initial prompt
+    print("\n=== Generating initial prompt via VLM ===")
+    initial_prompt = evaluator.generate_initial_prompt(em_image, organelle, mask_mode)
+    print(f"  Initial prompt: {initial_prompt}")
+    initial_params = _with_prompt(initial_params, initial_prompt)
 
     current_params = initial_params
     all_results: list[GenerationResult] = []
     all_evaluations: list[EvaluationResult] = []
     history: list[tuple[GenerationParams, EvaluationResult]] = []
 
+    # Determine tunable params for this backend
+    backend_key = _backend_name(gen_backend)
+    tunable_params = TUNABLE_PARAMS_BY_BACKEND.get(backend_key, {})
+
     # Track which param to tweak next and which direction
-    param_names = list(TUNABLE_PARAMS.keys())
+    param_names = list(tunable_params.keys())
     # Each param gets tried: +5%, if worse try -5%, if worse revert and move on
     # "param_to_try" cycles through params; "direction" is +1 or -1
     param_index = 0
@@ -88,14 +138,30 @@ def run_refinement_loop(
     for iteration in range(config.max_iterations):
         print(f"\n=== Iteration {iteration + 1}/{config.max_iterations} ===")
         print(f"  Prompt: {current_params.prompt}")
-        print(
-            f"  Params: strength={current_params.strength:.3f}, "
-            f"guidance_scale={current_params.guidance_scale:.2f}, "
-            f"num_inference_steps={current_params.num_inference_steps}"
-        )
+        param_strs = []
+        if current_params.strength is not None:
+            param_strs.append(f"strength={current_params.strength:.3f}")
+        param_strs.append(f"guidance_scale={current_params.guidance_scale:.2f}")
+        param_strs.append(f"num_inference_steps={current_params.num_inference_steps}")
+        print(f"  Params: {', '.join(param_strs)}")
 
         # Step 1: Generate
-        result = gen_backend.generate(em_image, current_params, iteration)
+        try:
+            result = gen_backend.generate(em_image, current_params, iteration, instance=instance, mask_mode=mask_mode)
+        except Exception as e:
+            print(f"  Generation failed: {e}")
+            # Save params so we know what was attempted
+            if config.save_intermediates and output_dir:
+                iter_dir = output_dir / f"iteration_{iteration:02d}"
+                iter_dir.mkdir(parents=True, exist_ok=True)
+                _save_evaluation(output_dir, iteration,
+                                 EvaluationResult(score=0.0, detailed_scores=None,
+                                                  issues=[f"Generation failed: {e}"],
+                                                  refined_prompt=None, param_adjustments={},
+                                                  should_stop=False, reasoning="generation error",
+                                                  raw_response=""),
+                                 current_params)
+            continue
         all_results.append(result)
 
         # Save intermediates
@@ -148,17 +214,23 @@ def run_refinement_loop(
             best_idx = iteration
             best_params = current_params
 
+        # Step 4b: Apply prompt refinement
+        next_params = _copy_params(current_params)
+        if evaluation.refined_prompt:
+            next_params = _with_prompt(next_params, evaluation.refined_prompt)
+            print(f"  Refined prompt: {next_params.prompt}")
+
+        if not param_names:
+            # No tunable params (e.g. Gemini) — only prompt refinement
+            current_params = next_params
+            continue
+
         if iteration == 0:
-            # First iteration is baseline — apply prompt refinement then start param sweep
-            next_params = _copy_params(current_params)
-            if evaluation.refined_prompt:
-                next_params = _with_prompt(next_params, evaluation.refined_prompt)
-                print(f"  Refined prompt: {next_params.prompt}")
-            # Apply first param change
+            # First iteration is baseline — start param sweep
             param_name = param_names[param_index]
             direction = 1
             tried_increase = True
-            next_params = _step_param(next_params, param_name, direction)
+            next_params = _step_param(next_params, param_name, direction, tunable_params)
             effect = {
                 "changed_param": param_name,
                 "direction": "+5%",
@@ -166,7 +238,7 @@ def run_refinement_loop(
                 "new_value": _get_param(next_params, param_name),
             }
             param_effects.append(effect)
-            print(f"  Next: {param_name} {'+5%' if direction > 0 else '-5%'} "
+            print(f"  Next: {param_name} +5% "
                   f"({effect['old_value']:.3f} -> {effect['new_value']:.3f})")
             current_params = next_params
             continue
@@ -182,33 +254,27 @@ def run_refinement_loop(
             param_effects[-1]["score_delta"] = score_delta
 
         if score_delta > 0:
-            # Improvement! Keep the change and move to next param
             print(f"  {param_name} change helped (+{score_delta:.3f}), keeping it")
             param_index = (param_index + 1) % len(param_names)
             direction = 1
             tried_increase = False
         elif tried_increase:
-            # +5% didn't help, try -5% (revert first, then go other way)
             print(f"  {param_name} +5% didn't help ({score_delta:+.3f}), trying -5%")
-            # Revert to before this change
             current_params = _revert_param(current_params, param_name, param_effects[-1])
+            next_params = _copy_params(current_params)
+            if evaluation.refined_prompt:
+                next_params = _with_prompt(next_params, evaluation.refined_prompt)
             direction = -1
-            tried_increase = False  # Now we're trying decrease
+            tried_increase = False
         else:
-            # -5% also didn't help, revert and move to next param
             print(f"  {param_name} -5% didn't help ({score_delta:+.3f}), reverting and moving on")
             current_params = _revert_param(current_params, param_name, param_effects[-1])
+            next_params = _copy_params(current_params)
+            if evaluation.refined_prompt:
+                next_params = _with_prompt(next_params, evaluation.refined_prompt)
             param_index = (param_index + 1) % len(param_names)
             direction = 1
             tried_increase = False
-
-        # Prepare next iteration
-        next_params = _copy_params(current_params)
-
-        # Apply prompt refinement from evaluator
-        if evaluation.refined_prompt:
-            next_params = _with_prompt(next_params, evaluation.refined_prompt)
-            print(f"  Refined prompt: {next_params.prompt}")
 
         # If score dropped significantly from best, revert to best params
         if evaluation.score < best_score - 0.1:
@@ -221,7 +287,7 @@ def run_refinement_loop(
         param_name = param_names[param_index]
         if direction == 1:
             tried_increase = True
-        next_params = _step_param(next_params, param_name, direction)
+        next_params = _step_param(next_params, param_name, direction, tunable_params)
         effect = {
             "changed_param": param_name,
             "direction": "+5%" if direction > 0 else "-5%",
@@ -263,15 +329,19 @@ def _get_param(params: GenerationParams, name: str) -> float:
     return float(getattr(params, name))
 
 
-def _step_param(params: GenerationParams, name: str, direction: int) -> GenerationParams:
+def _step_param(
+    params: GenerationParams, name: str, direction: int,
+    tunable: dict[str, tuple[float, float]] | None = None,
+) -> GenerationParams:
     """Change one parameter by ±5%, clamped to allowed range."""
     current_val = _get_param(params, name)
     delta = current_val * STEP_FRACTION * direction
     new_val = current_val + delta
 
     # Clamp to allowed range
-    lo, hi = TUNABLE_PARAMS[name]
-    new_val = max(lo, min(hi, new_val))
+    if tunable and name in tunable:
+        lo, hi = tunable[name]
+        new_val = max(lo, min(hi, new_val))
 
     return _with_param(params, name, new_val)
 
@@ -348,17 +418,20 @@ def _save_evaluation(
     iter_dir = output_dir / f"iteration_{iteration:02d}"
     iter_dir.mkdir(parents=True, exist_ok=True)
 
+    params_used = {
+        "prompt": params.prompt,
+        "guidance_scale": params.guidance_scale,
+        "num_inference_steps": params.num_inference_steps,
+        "threshold": params.threshold,
+        "seed": params.seed,
+    }
+    if params.strength is not None:
+        params_used["strength"] = params.strength
+
     data = {
         "score": evaluation.score,
         "detailed_scores": None,
-        "params_used": {
-            "prompt": params.prompt,
-            "strength": params.strength,
-            "guidance_scale": params.guidance_scale,
-            "num_inference_steps": params.num_inference_steps,
-            "threshold": params.threshold,
-            "seed": params.seed,
-        },
+        "params_used": params_used,
         "issues": evaluation.issues,
         "reasoning": evaluation.reasoning,
         "refined_prompt": evaluation.refined_prompt,
