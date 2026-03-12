@@ -20,11 +20,17 @@ class LLMBackend(ABC):
     """
 
     @abstractmethod
+    def chat_with_images(
+        self, system_prompt: str, user_prompt: str, images: list[Image.Image]
+    ) -> str:
+        """Send a message with one or more images and return the text response."""
+        ...
+
     def chat_with_image(
         self, system_prompt: str, user_prompt: str, image: Image.Image
     ) -> str:
-        """Send a message with an image and return the text response."""
-        ...
+        """Convenience wrapper for a single image."""
+        return self.chat_with_images(system_prompt, user_prompt, [image])
 
 
 class OllamaBackend(LLMBackend):
@@ -83,21 +89,43 @@ class OllamaBackend(LLMBackend):
             "Try running 'ollama serve' manually."
         )
 
-    def chat_with_image(
-        self, system_prompt: str, user_prompt: str, image: Image.Image
+    @staticmethod
+    def _resize_for_vlm(img: Image.Image, max_dim: int = 1008) -> Image.Image:
+        """Resize image so dimensions are divisible by 28 and within max_dim.
+
+        qwen2.5vl's vision encoder uses 28px patches and crashes on
+        incompatible dimensions (GGML_ASSERT failure in RoPE).
+        """
+        patch = 28
+        w, h = img.size
+        # Scale down if needed
+        scale = min(max_dim / w, max_dim / h, 1.0)
+        w, h = int(w * scale), int(h * scale)
+        # Round to nearest multiple of patch size
+        w = max(patch, (w // patch) * patch)
+        h = max(patch, (h // patch) * patch)
+        if (w, h) != img.size:
+            img = img.resize((w, h), Image.LANCZOS)
+        return img
+
+    def chat_with_images(
+        self, system_prompt: str, user_prompt: str, images: list[Image.Image]
     ) -> str:
         import ollama
 
-        buf = io.BytesIO()
-        image.save(buf, format="PNG")
-        image_bytes = buf.getvalue()
+        image_bytes_list = []
+        for img in images:
+            img = self._resize_for_vlm(img)
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            image_bytes_list.append(buf.getvalue())
 
         client = ollama.Client(host=self.host)
         response = client.chat(
             model=self.model,
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt, "images": [image_bytes]},
+                {"role": "user", "content": user_prompt, "images": image_bytes_list},
             ],
             format="json",
             options={"temperature": self.temperature, "num_predict": 1024},
@@ -118,67 +146,82 @@ class AnthropicBackend(LLMBackend):
         self.api_key = api_key
         self.temperature = temperature
 
-    def chat_with_image(
-        self, system_prompt: str, user_prompt: str, image: Image.Image
+    def chat_with_images(
+        self, system_prompt: str, user_prompt: str, images: list[Image.Image]
     ) -> str:
         import anthropic
 
-        buf = io.BytesIO()
-        image.save(buf, format="PNG")
-        image_b64 = base64.standard_b64encode(buf.getvalue()).decode()
+        content = []
+        for img in images:
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            image_b64 = base64.standard_b64encode(buf.getvalue()).decode()
+            content.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": image_b64,
+                },
+            })
+        content.append({"type": "text", "text": user_prompt})
 
         client = anthropic.Anthropic(api_key=self.api_key) if self.api_key else anthropic.Anthropic()
         response = client.messages.create(
             model=self.model,
             max_tokens=1024,
             system=system_prompt,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/png",
-                                "data": image_b64,
-                            },
-                        },
-                        {"type": "text", "text": user_prompt},
-                    ],
-                }
-            ],
+            messages=[{"role": "user", "content": content}],
             temperature=self.temperature,
         )
         return response.content[0].text
 
 
 class GoogleBackend(LLMBackend):
-    """Google Gemini API."""
+    """Google Gemini API (API key or Vertex AI)."""
 
     def __init__(
         self,
         model: str = "gemini-2.5-flash",
         api_key: str | None = None,
+        gcp_project: str | None = None,
+        gcp_location: str = "us-central1",
+        vertex_ai: bool = False,
         temperature: float = 0.3,
     ):
         self.model = model
         self.api_key = api_key
+        self.gcp_project = gcp_project
+        self.gcp_location = gcp_location
+        self.vertex_ai = vertex_ai
         self.temperature = temperature
 
-    def chat_with_image(
-        self, system_prompt: str, user_prompt: str, image: Image.Image
+    def chat_with_images(
+        self, system_prompt: str, user_prompt: str, images: list[Image.Image]
     ) -> str:
+        import os
+
         from google import genai
         from google.genai.errors import ClientError
 
-        client = genai.Client(api_key=self.api_key) if self.api_key else genai.Client()
+        if self.vertex_ai:
+            project = self.gcp_project or os.environ.get("GOOGLE_CLOUD_PROJECT")
+            client = genai.Client(
+                vertexai=True,
+                project=project,
+                location=self.gcp_location,
+            )
+        elif self.api_key:
+            client = genai.Client(api_key=self.api_key)
+        else:
+            client = genai.Client()
 
+        contents: list = list(images) + [f"{system_prompt}\n\n{user_prompt}"]
         for attempt in range(3):
             try:
                 response = client.models.generate_content(
                     model=self.model,
-                    contents=[image, f"{system_prompt}\n\n{user_prompt}"],
+                    contents=contents,
                     config=genai.types.GenerateContentConfig(
                         temperature=self.temperature
                     ),
@@ -206,32 +249,30 @@ class OpenAIBackend(LLMBackend):
         self.api_key = api_key
         self.temperature = temperature
 
-    def chat_with_image(
-        self, system_prompt: str, user_prompt: str, image: Image.Image
+    def chat_with_images(
+        self, system_prompt: str, user_prompt: str, images: list[Image.Image]
     ) -> str:
         from openai import OpenAI
 
-        buf = io.BytesIO()
-        image.save(buf, format="PNG")
-        image_b64 = base64.standard_b64encode(buf.getvalue()).decode()
+        content = []
+        for img in images:
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            image_b64 = base64.standard_b64encode(buf.getvalue()).decode()
+            content.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/png;base64,{image_b64}",
+                },
+            })
+        content.append({"type": "text", "text": user_prompt})
 
         client = OpenAI(api_key=self.api_key) if self.api_key else OpenAI()
         response = client.chat.completions.create(
             model=self.model,
             messages=[
                 {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/png;base64,{image_b64}",
-                            },
-                        },
-                        {"type": "text", "text": user_prompt},
-                    ],
-                },
+                {"role": "user", "content": content},
             ],
             temperature=self.temperature,
             max_tokens=1024,
@@ -257,6 +298,10 @@ def create_llm_backend(provider: str, **kwargs) -> LLMBackend:
             f"Unknown LLM provider: {provider!r}. "
             f"Available: {list(backends.keys())}"
         )
+    # Strip kwargs not accepted by non-Google backends
+    if provider != "google":
+        for key in ("gcp_project", "gcp_location", "vertex_ai"):
+            kwargs.pop(key, None)
     return backends[provider](**kwargs)
 
 
