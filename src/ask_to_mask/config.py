@@ -35,8 +35,8 @@ class OrganelleClass:
         """Build a semantic segmentation prompt, optionally with EM description."""
         parts = self._build_context(detailed, resolution_nm=resolution_nm)
         parts.append(
-            f"Color all the {self.name} in {self.color_name}. "
-            f"Keep everything else unchanged."
+            f"Create a segmentation mask: color all the {self.name} in "
+            f"{self.color_name} and make everything else black."
         )
         return " ".join(parts)
 
@@ -51,15 +51,50 @@ class OrganelleClass:
         )
         return " ".join(parts)
 
-    def build_instance_prompt(
+    def build_direct_prompt(
         self, detailed: bool = False, resolution_nm: float | None = None,
     ) -> str:
-        """Build an instance segmentation prompt, optionally with EM description."""
+        """Build a direct mask prompt: white organelle on black background."""
         parts = self._build_context(detailed, resolution_nm=resolution_nm)
         parts.append(
-            f"Color each individual {self.name} a different unique bright color "
-            f"to distinguish separate instances. Keep everything else unchanged."
+            f"Create a segmentation mask: show only the {self.name} in white "
+            f"on a completely black background. Nothing else should be visible."
         )
+        return " ".join(parts)
+
+    def build_invert_prompt(
+        self, detailed: bool = False, resolution_nm: float | None = None,
+    ) -> str:
+        """Build a prompt that segments background/edges, to be inverted for instances."""
+        parts = self._build_context(detailed, resolution_nm=resolution_nm)
+        parts.append(
+            f"Create a segmentation mask: color the background and edges between "
+            f"{self.name} in white on a completely black background. The {self.name} "
+            f"interiors should be black, only the boundaries and space between them "
+            f"should be white."
+        )
+        return " ".join(parts)
+
+    def build_instance_prompt(
+        self, detailed: bool = False, resolution_nm: float | None = None,
+        direct: bool = False,
+    ) -> str:
+        """Build an instance segmentation prompt, optionally with EM description.
+
+        If direct=True, instances are colored on a black background instead of
+        on the original EM image.
+        """
+        parts = self._build_context(detailed, resolution_nm=resolution_nm)
+        if direct:
+            parts.append(
+                f"Color each individual {self.name} a different unique bright color "
+                f"to distinguish separate instances. Make everything else completely black."
+            )
+        else:
+            parts.append(
+                f"Color each individual {self.name} a different unique bright color "
+                f"to distinguish separate instances. Keep everything else unchanged."
+            )
         return " ".join(parts)
 
 
@@ -114,11 +149,14 @@ ORGANELLES: dict[str, OrganelleClass] = {
         color_name="bright red",
         rgb=(255, 0, 0),
         description=(
-            "large, ovoid organelles with outer and inner membranes that form "
-            "cristae. They can fuse and branch to form tubular networks. Inner "
-            "membrane folding density varies by cell type."
+            "large (500-2000 nm), ovoid or elongated organelles with a smooth outer "
+            "membrane and a highly folded inner membrane forming cristae (visible as "
+            "dark internal lamellar or tubular folds). They appear as dark-bordered "
+            "oval or bean-shaped structures with a distinctive internal striated or "
+            "layered texture. They can fuse and branch to form tubular networks. "
+            "Their electron density is moderate—darker than cytosol but lighter than "
+            "ribosomes. Cristae density varies by cell type and metabolic state."
         ),
-
     ),
     "er": OrganelleClass(
         key="er",
@@ -126,12 +164,14 @@ ORGANELLES: dict[str, OrganelleClass] = {
         color_name="bright green",
         rgb=(0, 255, 0),
         description=(
-            "an extensive network of tubular structures often studded with "
-            "ribosomes. ER tubules always connect back to themselves and "
-            "ultimately connect to the nuclear envelope. Unlike similar-looking "
-            "multivesicular bodies, ER is never disconnected."
+            "an extensive, interconnected network of flattened cisternae and tubules "
+            "(30-60 nm lumen width) that pervades the cytoplasm. Rough ER appears as "
+            "parallel membrane pairs studded with dark ribosome dots on the cytoplasmic "
+            "face; smooth ER lacks ribosomes and forms more tubular profiles. ER tubules "
+            "always connect back to themselves and ultimately connect to the nuclear "
+            "envelope. Unlike similar-looking multivesicular bodies or vesicles, ER is "
+            "never disconnected—it forms a single continuous network."
         ),
-
     ),
     "nucleus": OrganelleClass(
         key="nucleus",
@@ -139,12 +179,14 @@ ORGANELLES: dict[str, OrganelleClass] = {
         color_name="bright blue",
         rgb=(0, 0, 255),
         description=(
-            "a large, roughly spherical organelle bounded by a double-membrane "
-            "nuclear envelope perforated with nuclear pores. Contains chromatin "
-            "(dark heterochromatin clusters and lighter euchromatin) and often "
-            "a dense, spherical nucleolus."
+            "the largest organelle (5-15 µm diameter), roughly spherical or ovoid, "
+            "bounded by a double-membrane nuclear envelope perforated with nuclear "
+            "pores. The interior contains chromatin: dark, electron-dense heterochromatin "
+            "clusters (often along the envelope periphery) and lighter, diffuse "
+            "euchromatin. A dense, spherical nucleolus (1-5 µm) is often visible as "
+            "the darkest sub-nuclear structure. The nucleoplasm between chromatin "
+            "regions appears as a relatively uniform, light gray matrix."
         ),
-        # approx_size_nm=(5000, 15000),
     ),
     "lipid_droplet": OrganelleClass(
         key="lipid_droplet",
@@ -152,12 +194,13 @@ ORGANELLES: dict[str, OrganelleClass] = {
         color_name="bright yellow",
         rgb=(255, 255, 0),
         description=(
-            "spherical organelles enclosed by a lipid monolayer with a shriveled, "
-            "'lumpy' morphology due to general staining. Generally lighter than "
-            "surrounding cytosol with subtle membrane staining. Distinct texture "
-            "compared to lysosomes and endosomes."
+            "spherical organelles (100 nm-5 µm) enclosed by a lipid monolayer (not a "
+            "bilayer). In heavy-metal stained EM they appear with a shriveled, lumpy "
+            "morphology and a generally lighter, more homogeneous interior compared to "
+            "the surrounding cytosol. Their boundary shows subtle membrane staining. "
+            "Distinguished from lysosomes and endosomes by their lighter, more uniform "
+            "interior and absence of internal vesicles or dense granular content."
         ),
-        # approx_size_nm=(100, 5000),
     ),
     "plasma_membrane": OrganelleClass(
         key="plasma_membrane",
@@ -165,12 +208,13 @@ ORGANELLES: dict[str, OrganelleClass] = {
         color_name="bright cyan",
         rgb=(0, 255, 255),
         description=(
-            "a thin, extensive lipid bilayer that surrounds the cell and "
-            "separates extracellular space from the cytosol. Always connects "
-            "back to itself. If disconnected, it is likely part of the "
-            "endosomal network."
+            "a thin (~7-8 nm) dark line delineating the outer boundary of the cell, "
+            "separating extracellular space from the cytosol. It appears as a continuous "
+            "electron-dense bilayer that follows the entire cell contour, including "
+            "microvilli, filopodia, and invaginations. It always forms a closed boundary "
+            "around a cell. If a membrane segment appears disconnected from the cell "
+            "surface, it is likely part of the endosomal network instead."
         ),
-        # approx_size_nm=(7, 8),
     ),
     "nuclear_envelope": OrganelleClass(
         key="nuclear_envelope",
@@ -178,12 +222,14 @@ ORGANELLES: dict[str, OrganelleClass] = {
         color_name="bright magenta",
         rgb=(255, 0, 255),
         description=(
-            "a double-membrane structure (two lipid bilayers) often studded "
-            "with ribosomes. Connects back to itself and is continuous with "
-            "ER networks. Perforated with ~120 nm nuclear pores. Establishes "
-            "a boundary between chromatin and the cytosol."
+            "a double-membrane structure (~30-50 nm total thickness) consisting of two "
+            "parallel lipid bilayers (inner and outer nuclear membranes) separated by "
+            "the perinuclear space. The outer membrane is often studded with ribosomes, "
+            "making it continuous with rough ER. It forms a closed boundary around the "
+            "nucleus and is perforated by ~120 nm nuclear pore complexes visible as "
+            "gaps or electron-dense ring structures. It separates the chromatin-containing "
+            "nucleoplasm from the cytosol."
         ),
-        # approx_size_nm=(30, 50),
     ),
     "nuclear_pore": OrganelleClass(
         key="nuclear_pore",
@@ -191,11 +237,13 @@ ORGANELLES: dict[str, OrganelleClass] = {
         color_name="bright orange",
         rgb=(255, 128, 0),
         description=(
-            "circular, ~120 nm pores in the nuclear envelope. In cross-section, "
-            "they appear as breaks or gaps in envelope connectivity. They span "
-            "both bilayers of the nuclear envelope."
+            "~120 nm diameter protein complexes that perforate the nuclear envelope. "
+            "In en-face views they appear as ring-shaped electron-dense structures; in "
+            "cross-section they appear as breaks or gaps in envelope connectivity where "
+            "the inner and outer nuclear membranes fuse. A central plug or transporter "
+            "is sometimes visible. They span both bilayers of the nuclear envelope and "
+            "are distributed across the entire nuclear surface."
         ),
-        # approx_size_nm=(100, 140),
     ),
     "nucleolus": OrganelleClass(
         key="nucleolus",
@@ -203,10 +251,13 @@ ORGANELLES: dict[str, OrganelleClass] = {
         color_name="bright purple",
         rgb=(128, 0, 255),
         description=(
-            "a dark, dense spherical structure within the nucleus. Darker "
-            "stained (denser) than the rest of the nucleus."
+            "a large (1-5 µm), dense, roughly spherical sub-nuclear body that is the "
+            "most electron-dense structure within the nucleus. It has a granular and "
+            "fibrillar internal texture with distinct sub-compartments: a dense fibrillar "
+            "component, a granular component, and sometimes fibrillar centers (lighter "
+            "regions). It stains significantly darker than surrounding chromatin and "
+            "nucleoplasm. Not bounded by a membrane."
         ),
-        # approx_size_nm=(1000, 5000),
     ),
     "heterochromatin": OrganelleClass(
         key="heterochromatin",
@@ -214,11 +265,13 @@ ORGANELLES: dict[str, OrganelleClass] = {
         color_name="bright spring green",
         rgb=(0, 255, 128),
         description=(
-            "dark, compact clusters of chromatin within the nucleus. Stains "
-            "darker and is more compact than euchromatin. Excludes chromatin "
-            "associated with the nucleolus."
+            "dark, electron-dense, compact clusters of tightly packed chromatin within "
+            "the nucleus. Typically found along the inner surface of the nuclear envelope "
+            "(peripheral heterochromatin) and around the nucleolus (perinucleolar "
+            "heterochromatin). Stains significantly darker and is more compact than the "
+            "diffuse euchromatin regions. Excludes the nucleolus itself, which has a "
+            "distinct granular/fibrillar texture."
         ),
-        # approx_size_nm=(100, 5000),
     ),
     "euchromatin": OrganelleClass(
         key="euchromatin",
@@ -226,12 +279,27 @@ ORGANELLES: dict[str, OrganelleClass] = {
         color_name="bright rose",
         rgb=(255, 0, 128),
         description=(
-            "light, diffuse chromatin within the nucleus. Stains lighter and "
-            "is less compact than heterochromatin. Excludes chromatin "
-            "associated with the nucleolus. Located outside of the nucleolus "
-            "region."
+            "light, diffuse, loosely packed chromatin that fills much of the nuclear "
+            "interior between heterochromatin clusters. Appears as a lighter gray, more "
+            "uniform matrix compared to the dark heterochromatin. Represents "
+            "transcriptionally active chromatin regions. Located outside of the nucleolus "
+            "and distinct from the dense nucleolar sub-structure. Excludes chromatin "
+            "directly associated with the nucleolus."
         ),
-        # approx_size_nm=(100, 10000),
+    ),
+    "cell": OrganelleClass(
+        key="cell",
+        name="cells",
+        color_name="bright red",
+        rgb=(255, 0, 0),
+        description=(
+            "whole cells bounded by a plasma membrane. Each cell contains cytoplasm "
+            "filled with various organelles (mitochondria, ER, nucleus, etc.) and a "
+            "relatively uniform cytosolic matrix. Cell boundaries are defined by the "
+            "plasma membrane—a thin dark line separating one cell from another or from "
+            "extracellular space. Extracellular regions may appear lighter or contain "
+            "extracellular matrix material."
+        ),
     ),
 }
 
