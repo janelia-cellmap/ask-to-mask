@@ -444,7 +444,7 @@ def create_gen_backend(backend: str, **kwargs) -> ImageGenBackend:
     """Factory function for image generation backends.
 
     Args:
-        backend: Backend name. "flux", "gemini", "glm", or "qwen".
+        backend: Backend name. "flux", "gemini", "glm", "qwen", or "sam3".
         **kwargs: Backend-specific arguments.
     """
     if backend == "flux":
@@ -477,4 +477,10 @@ def create_gen_backend(backend: str, **kwargs) -> ImageGenBackend:
             model = model_key
         kwargs["model"] = model
         return QwenImageEditBackend(**kwargs)
+    if backend == "sam3":
+        for key in ("gcp_project", "gcp_location", "vertex_ai", "lora_path", "api_key", "model_key"):
+            kwargs.pop(key, None)
+        from .sam3_backend import SAM3Backend
+
+        return SAM3Backend(**kwargs)
     raise ValueError(f"Unknown image generation backend: {backend!r}")

@@ -8,6 +8,7 @@ from .gen_backend import (
     QwenImageEditBackend,
     create_gen_backend,
 )
+from .sam3_backend import SAM3Backend
 from .llm_backend import LLMBackend, create_llm_backend
 from .loop import LoopConfig, LoopResult, run_refinement_loop
 from .schemas import (
@@ -23,6 +24,7 @@ __all__ = [
     "GeminiImageBackend",
     "GLMImageBackend",
     "QwenImageEditBackend",
+    "SAM3Backend",
     "create_gen_backend",
     "LLMBackend",
     "create_llm_backend",

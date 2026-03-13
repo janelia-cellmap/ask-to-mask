@@ -45,6 +45,8 @@ class OllamaBackend(LLMBackend):
         self.model = model
         self.host = host
         self.temperature = temperature
+        # Molmo outputs XML-like point tags, not JSON — don't force JSON format
+        self.force_json = "molmo" not in model.lower()
         self._server_process = None
         self._ensure_server()
 
@@ -121,15 +123,17 @@ class OllamaBackend(LLMBackend):
             image_bytes_list.append(buf.getvalue())
 
         client = ollama.Client(host=self.host)
-        response = client.chat(
-            model=self.model,
-            messages=[
+        chat_kwargs: dict = {
+            "model": self.model,
+            "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt, "images": image_bytes_list},
             ],
-            format="json",
-            options={"temperature": self.temperature, "num_predict": 1024},
-        )
+            "options": {"temperature": self.temperature, "num_predict": 1024},
+        }
+        if self.force_json:
+            chat_kwargs["format"] = "json"
+        response = client.chat(**chat_kwargs)
         return response["message"]["content"]
 
 
@@ -280,11 +284,123 @@ class OpenAIBackend(LLMBackend):
         return response.choices[0].message.content
 
 
+class HuggingFaceBackend(LLMBackend):
+    """Local VLM via HuggingFace transformers. Loads model on first use."""
+
+    def __init__(
+        self,
+        model: str = "allenai/Molmo2-8B",
+        temperature: float = 0.3,
+        device: str | None = None,
+    ):
+        self.model_name = model
+        self.temperature = temperature
+        self.device = device or "cuda"
+        self._processor = None
+        self._model = None
+
+    def _load_model(self):
+        if self._model is not None:
+            return
+        import torch
+        from transformers import AutoProcessor
+
+        print(f"Loading HuggingFace model {self.model_name}...")
+        try:
+            self._processor = AutoProcessor.from_pretrained(
+                self.model_name, trust_remote_code=True, padding_side="left"
+            )
+        except TypeError as e:
+            if "Unexpected keyword argument" in str(e):
+                # Molmo2's processor passes optional attrs to super().__init__()
+                # which some transformers versions reject. Patch and retry.
+                from transformers.processing_utils import ProcessorMixin
+                orig_init = ProcessorMixin.__init__
+                def _patched_init(self_proc, *args, **kwargs):
+                    known = set(type(self_proc).get_attributes())
+                    known.add("chat_template")
+                    extra = {k: kwargs.pop(k) for k in list(kwargs) if k not in known}
+                    orig_init(self_proc, *args, **kwargs)
+                    for k, v in extra.items():
+                        setattr(self_proc, k, v)
+                ProcessorMixin.__init__ = _patched_init
+                try:
+                    self._processor = AutoProcessor.from_pretrained(
+                        self.model_name, trust_remote_code=True
+                    )
+                finally:
+                    ProcessorMixin.__init__ = orig_init
+            else:
+                raise
+
+        # Try model classes in order: ImageTextToText (Molmo2), CausalLM, AutoModel
+        model_kwargs = dict(
+            trust_remote_code=True,
+            dtype="auto",
+            device_map="auto",
+        )
+        import transformers
+        errors = []
+        for auto_cls_name in ("AutoModelForImageTextToText", "AutoModelForCausalLM", "AutoModel"):
+            try:
+                auto_cls = getattr(transformers, auto_cls_name)
+                self._model = auto_cls.from_pretrained(self.model_name, **model_kwargs)
+                print(f"Model loaded via {auto_cls_name} on {self.device}.")
+                return
+            except Exception as e:
+                errors.append(f"{auto_cls_name}: {type(e).__name__}: {e}")
+                continue
+        raise RuntimeError(
+            f"Could not load {self.model_name} with any AutoModel class:\n"
+            + "\n".join(errors)
+        )
+
+    def chat_with_images(
+        self, system_prompt: str, user_prompt: str, images: list[Image.Image]
+    ) -> str:
+        import torch
+        self._load_model()
+
+        prompt = f"{system_prompt}\n\n{user_prompt}"
+
+        # Build chat messages for apply_chat_template
+        content: list[dict] = [{"type": "text", "text": prompt}]
+        for img in images:
+            content.append({"type": "image", "image": img})
+        messages = [{"role": "user", "content": content}]
+
+        try:
+            # Molmo2 / newer HF VLMs use apply_chat_template
+            inputs = self._processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_tensors="pt",
+                return_dict=True,
+            )
+        except Exception:
+            # Fallback for older Molmo / other HF VLMs
+            inputs = self._processor.process(images=images, text=prompt)
+            inputs = {
+                k: v.unsqueeze(0) if hasattr(v, "unsqueeze") else v
+                for k, v in inputs.items()
+            }
+
+        inputs = {k: v.to(self._model.device) if hasattr(v, "to") else v for k, v in inputs.items()}
+
+        with torch.inference_mode():
+            output = self._model.generate(**inputs, max_new_tokens=2048)
+
+        generated = output[0, inputs["input_ids"].size(1):]
+        text = self._processor.tokenizer.decode(generated, skip_special_tokens=True)
+        return text
+
+
 def create_llm_backend(provider: str, **kwargs) -> LLMBackend:
     """Factory function for LLM/VLM backends.
 
     Args:
-        provider: One of "ollama", "anthropic", "google", "openai".
+        provider: One of "ollama", "anthropic", "google", "openai", "huggingface".
         **kwargs: Provider-specific arguments (model, api_key, host, etc.).
     """
     backends = {
@@ -292,6 +408,7 @@ def create_llm_backend(provider: str, **kwargs) -> LLMBackend:
         "anthropic": AnthropicBackend,
         "google": GoogleBackend,
         "openai": OpenAIBackend,
+        "huggingface": HuggingFaceBackend,
     }
     if provider not in backends:
         raise ValueError(
@@ -301,6 +418,10 @@ def create_llm_backend(provider: str, **kwargs) -> LLMBackend:
     # Strip kwargs not accepted by non-Google backends
     if provider != "google":
         for key in ("gcp_project", "gcp_location", "vertex_ai"):
+            kwargs.pop(key, None)
+    # Strip kwargs not accepted by HuggingFace backend
+    if provider == "huggingface":
+        for key in ("host", "api_key"):
             kwargs.pop(key, None)
     return backends[provider](**kwargs)
 

@@ -211,7 +211,7 @@ packages:
 - pypi: .
   name: ask-to-mask
   version: 0.1.0
-  sha256: eac28c601bb73d4e687ed9a981457f072ab2cc4fa7e33d503cba884d5b560c38
+  sha256: 673272f41ad5c3fabaca7c42228ab9c513eaa33bee232f351dd7df82946ddac4
   requires_dist:
   - diffusers>=0.32.0
   - transformers
@@ -234,6 +234,11 @@ packages:
   - google-genai>=1.0.0 ; extra == 'agents-google'
   - ollama>=0.4.0 ; extra == 'agents-openai'
   - openai>=1.0.0 ; extra == 'agents-openai'
+  - sam3 @ git+https://github.com/facebookresearch/sam3.git ; extra == 'sam3'
+  - decord ; extra == 'sam3'
+  - einops ; extra == 'sam3'
+  - pycocotools ; extra == 'sam3'
+  - scipy ; extra == 'sam3'
   requires_python: '>=3.12'
   editable: true
 - conda: https://conda.anaconda.org/conda-forge/linux-64/bzip2-1.0.8-hda65f42_9.conda
