@@ -19,7 +19,12 @@ pixi run segment list-organelles
 - `src/ask_to_mask/model.py` — Loads Flux pipelines via HuggingFace diffusers (supports Kontext Dev and Flux 2 Dev)
 - `src/ask_to_mask/postprocess.py` — Extracts binary masks from color difference between input/output images
 - `src/ask_to_mask/pipeline.py` — Orchestrates the full flow: load image → resize → infer → extract mask → save
-- `src/ask_to_mask/cli.py` — argparse CLI with `segment` and `list-organelles` subcommands
+- `src/ask_to_mask/cli.py` — argparse CLI with `segment`, `refine`, `train`, and `list-organelles` subcommands
+- `src/ask_to_mask/agents/gen_backend.py` — Pluggable image generation backends (Flux, Gemini, GLM, Qwen, SAM3)
+- `src/ask_to_mask/agents/sam3_backend.py` — SAM3 segmentation backend with text, VLM-coordinate, and painted-marker strategies
+- `src/ask_to_mask/agents/marker_detection.py` — Colored marker detection for SAM3 painted-marker strategy
+- `src/ask_to_mask/agents/evaluator.py` — VLM evaluator with point-based refinement for SAM3
+- `src/ask_to_mask/agents/loop.py` — Generate-evaluate-refine orchestrator
 
 ## Conventions
 

@@ -28,6 +28,31 @@ train = [
     "tensorboard",
     "bitsandbytes",
 ]
+agents = [
+    "google-genai>=1.0.0",
+]
+agents-anthropic = [
+    "ollama>=0.4.0",
+    "anthropic>=0.40.0",
+]
+agents-google = [
+    "ollama>=0.4.0",
+    "google-genai>=1.0.0",
+]
+agents-openai = [
+    "ollama>=0.4.0",
+    "openai>=1.0.0",
+]
+sam3 = [
+    "sam3 @ git+https://github.com/facebookresearch/sam3.git",
+    "decord",
+    "einops",
+    "pycocotools",
+    "scipy",
+]
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ask_to_mask"]

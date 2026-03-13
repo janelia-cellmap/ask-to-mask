@@ -1,5 +1,10 @@
+# Credentials
+vertex-sa.json
+
 # Project outputs and example data
 out/
+output/
+outputs/
 examples/
 
 # Training runs, checkpoints, and config caches

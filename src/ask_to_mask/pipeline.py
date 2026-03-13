@@ -91,6 +91,7 @@ def segment_single(
     custom_prompt: str | None = None,
     instance: bool = False,
     detailed_prompt: bool = False,
+    resolution_nm: float | None = None,
 ) -> Path:
     """Run the full pipeline for one image and one organelle class.
 
@@ -112,9 +113,9 @@ def segment_single(
     if custom_prompt:
         prompt = custom_prompt
     elif instance:
-        prompt = organelle.build_instance_prompt(detailed_prompt)
+        prompt = organelle.build_instance_prompt(detailed_prompt, resolution_nm=resolution_nm)
     else:
-        prompt = organelle.build_prompt(detailed_prompt)
+        prompt = organelle.build_prompt(detailed_prompt, resolution_nm=resolution_nm)
 
     print(f"  Prompt: {prompt}")
 

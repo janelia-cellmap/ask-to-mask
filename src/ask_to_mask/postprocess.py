@@ -50,14 +50,10 @@ def extract_mask(
     else:
         score = on_min
 
-    mask = (score > threshold).astype(np.uint8)
+    # Clip score to [0, 255] and return as continuous mask
+    mask = np.clip(score, 0, 255).astype(np.uint8)
 
-    if cleanup:
-        selem = disk(2)
-        mask = opening(mask, selem).astype(np.uint8)
-        mask = closing(mask, selem).astype(np.uint8)
-
-    return mask * 255
+    return mask
 
 
 def extract_instance_mask(
@@ -106,6 +102,91 @@ def extract_instance_mask(
             if np.sum(labels == region_id) < min_size:
                 labels[labels == region_id] = 0
         # Re-label to fill gaps in IDs
+        labels = label(labels > 0, connectivity=2)
+
+    return labels.astype(np.uint16)
+
+
+def extract_direct_mask(
+    output_image: Image.Image,
+    brightness_threshold: float = 128.0,
+    cleanup: bool = True,
+    min_size: int = 50,
+) -> np.ndarray:
+    """Extract a mask from a direct mask-style output (white on black).
+
+    The model is prompted to produce white organelles on a black background,
+    so we just threshold brightness.
+
+    Args:
+        output_image: Generated image (expected: white organelles, black background).
+        brightness_threshold: Minimum brightness to count as foreground (0-255).
+        cleanup: Apply morphological opening/closing to remove noise.
+        min_size: Remove connected components smaller than this.
+
+    Returns:
+        Binary mask as uint8 array (0 or 255).
+    """
+    out = np.array(output_image.convert("L")).astype(np.float32)
+    mask = (out > brightness_threshold).astype(np.uint8) * 255
+
+    if cleanup:
+        selem = disk(2)
+        mask = opening(mask, selem).astype(np.uint8)
+        mask = closing(mask, selem).astype(np.uint8)
+
+    if min_size > 0:
+        labels = label(mask > 0, connectivity=2)
+        for region_id in range(1, labels.max() + 1):
+            if np.sum(labels == region_id) < min_size:
+                mask[labels == region_id] = 0
+
+    return mask
+
+
+def extract_invert_mask(
+    output_image: Image.Image,
+    brightness_threshold: float = 128.0,
+    cleanup: bool = True,
+    min_size: int = 50,
+) -> np.ndarray:
+    """Extract instance masks by inverting a background/edge segmentation.
+
+    The model produces white background/edges on black. We invert so the dark
+    regions (cell interiors) become foreground, then label connected components
+    to get individual instances.
+
+    Args:
+        output_image: Generated image (expected: white edges/background, black interiors).
+        brightness_threshold: Threshold for background detection (0-255).
+        cleanup: Apply morphological opening/closing to remove noise.
+        min_size: Remove instances smaller than this many pixels.
+
+    Returns:
+        Instance label array as uint16 (0 = background, 1..N = instances).
+    """
+    # Get the background/edge mask
+    bg_mask = extract_direct_mask(
+        output_image, brightness_threshold=brightness_threshold,
+        cleanup=cleanup, min_size=0,
+    )
+
+    # Invert: background becomes 0, cell interiors become foreground
+    fg_mask = (bg_mask == 0).astype(np.uint8)
+
+    if cleanup:
+        selem = disk(3)
+        fg_mask = opening(fg_mask, selem).astype(np.uint8)
+        fg_mask = closing(fg_mask, selem).astype(np.uint8)
+
+    # Label connected components — each cell interior becomes a unique instance
+    labels = label(fg_mask, connectivity=2)
+
+    # Remove small instances
+    if min_size > 0:
+        for region_id in range(1, labels.max() + 1):
+            if np.sum(labels == region_id) < min_size:
+                labels[labels == region_id] = 0
         labels = label(labels > 0, connectivity=2)
 
     return labels.astype(np.uint16)

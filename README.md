@@ -100,6 +100,124 @@ Each organelle is assigned a distinct high-contrast color for clean mask extract
 | `heterochromatin` | Heterochromatin | Spring green | 100-5000 nm |
 | `euchromatin` | Euchromatin | Rose | 100-10000 nm |
 
+## Agentic refinement
+
+Iteratively improve mask quality using a VLM evaluator agent. Each iteration generates a mask, sends it (alongside the original EM image) to a vision-language model for critique, and uses the feedback to refine the prompt and parameters.
+
+### Setup
+
+```bash
+# Install agent dependencies (Gemini evaluator backend, default)
+pip install -e '.[agents-google]'
+
+# Or install ollama backend instead
+pip install -e '.[agents]'
+
+# For other LLM providers:
+pip install -e '.[agents-anthropic]'  # Claude
+pip install -e '.[agents-openai]'     # GPT-4o
+```
+
+The ollama backend requires a running ollama server with a vision model:
+
+```bash
+ollama serve
+ollama pull llama3.2-vision
+```
+
+### Run
+
+```bash
+# Basic refinement loop (default evaluator: Gemini)
+pixi run segment refine --input image.png --output-dir ./refined/ --organelle mito
+
+# Use ollama evaluator instead (free, local)
+pixi run segment refine --input image.png --output-dir ./refined/ --organelle mito \
+  --llm-provider ollama --llm-model gemma3:27b
+
+# Use a different LLM provider
+pixi run segment refine --input image.png --output-dir ./refined/ --organelle mito \
+    --llm-provider anthropic --llm-model claude-sonnet-4-20250514
+
+# Customize loop parameters
+pixi run segment refine --input image.png --output-dir ./refined/ --organelle mito \
+    --max-iterations 3 --min-score 0.9 --guidance-scale 4.0
+
+# Use Flux2 with LoRA weights
+pixi run segment refine --input image.png --output-dir ./refined/ --organelle mito \
+    --model flux2-dev --lora checkpoints/flux2-lora
+
+# Use Qwen image editing backend
+pixi run segment refine --input image.png --output-dir ./refined/ --organelle mito \
+  --gen-backend qwen --model Qwen/Qwen-Image-Edit-2511
+
+# Qwen with explicit defaults (and you can adjust as needed)
+pixi run segment refine --input image.png --output-dir ./refined/ --organelle mito \
+  --gen-backend qwen --model Qwen/Qwen-Image-Edit-2511 \
+  --num-steps 40 --guidance-scale 1.0 --true-cfg-scale 4.0
+```
+
+Each iteration saves `colored.png`, `mask.png`, and `evaluation.json` to `iteration_00/`, `iteration_01/`, etc. The loop stops when the evaluator scores the mask above `--min-score` or `--max-iterations` is reached.
+
+### Architecture
+
+Both the image generation model and the evaluator VLM are pluggable:
+
+- **Image gen backends** (`--gen-backend`): `flux` (default), `gemini`, `glm`, `qwen`, `sam3`.
+- **LLM backends** (`--llm-provider`): `ollama`, `anthropic`, `google`, `openai`, `huggingface`.
+
+Qwen backend note: `QwenImageEditPlusPipeline` may require a newer `diffusers` build. If import fails, run:
+
+```bash
+pixi run pip install --upgrade "git+https://github.com/huggingface/diffusers"
+```
+
+### SAM3 backend
+
+Use SAM3 (Segment Anything Model 3) for precise segmentation with VLM-guided prompting. Instead of a generative model painting colored overlays, SAM3 directly segments organelles using point or text prompts.
+
+#### Setup
+
+```bash
+pip install -e '.[sam3]'
+# SAM3 checkpoints require HuggingFace auth:
+huggingface-cli login
+```
+
+#### Strategies
+
+SAM3 supports three prompting strategies via `--sam3-strategy`:
+
+- **text** (default): Uses SAM3's open-vocabulary text prompts (e.g. "mitochondria"). The loop cycles through synonym prompts per iteration.
+- **vlm-coordinate**: A VLM examines the EM image and provides (x, y) center coordinates for each organelle instance. Each point is fed to SAM3 independently as its own instance — SAM3 runs one `predict()` call per point and produces a separate mask for each. The evaluator VLM then reviews the result and suggests adding/removing points across refinement iterations.
+- **painted-marker**: A secondary generative model paints dot markers at organelle centers, which are detected via color difference and converted to SAM3 point prompts (same one-point-per-instance approach).
+
+```bash
+# Text mode — simplest, uses organelle name as SAM3 text prompt
+pixi run segment refine --input image.png --output-dir ./refined/ --organelle mito \
+  --gen-backend sam3 --sam3-strategy text --llm-provider google
+
+# VLM-coordinate mode — VLM provides point coordinates for SAM3
+pixi run segment refine --input image.png --output-dir ./refined/ --organelle mito \
+  --gen-backend sam3 --sam3-strategy vlm-coordinate --llm-provider anthropic
+
+# Painted-marker mode — gen model paints dots, detected and fed to SAM3
+pixi run segment refine --input image.png --output-dir ./refined/ --organelle mito \
+  --gen-backend sam3 --sam3-strategy painted-marker --marker-backend gemini --llm-provider google
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--sam3-strategy` | `text` | Prompting strategy: `text`, `vlm-coordinate`, `painted-marker` |
+| `--sam3-model` | `facebook/sam3` | SAM3 HuggingFace model ID |
+| `--sam3-confidence` | `0.5` | Mask confidence threshold |
+| `--marker-backend` | None | Gen backend for painting markers (required for `painted-marker`) |
+
+The VLM-coordinate strategy also supports a HuggingFace backend (`--llm-provider huggingface`) for local VLM inference, including Molmo models which use native pointing output rather than JSON coordinates.
+
+Output intermediates include `colored.png` (semi-transparent overlay of instance masks on the EM image), `mask.png` (color-coded instance labels), `points.png` (point prompts visualized on the EM), and `evaluation.json`.
+
+
 ## LoRA finetuning
 
 Finetune Flux on annotated CellMap EM data to improve organelle recognition.
@@ -177,6 +295,14 @@ src/ask_to_mask/
   model.py         # Flux model loading and inference (with LoRA support)
   pipeline.py      # Orchestrates load → prompt → infer → postprocess
   postprocess.py   # Mask extraction (semantic + instance)
+  agents/
+    gen_backend.py      # Pluggable image generation backends (Flux, Gemini, GLM, Qwen)
+    sam3_backend.py     # SAM3 segmentation backend (text, VLM-coordinate, painted-marker)
+    marker_detection.py # Colored marker detection for SAM3 painted-marker strategy
+    llm_backend.py      # Pluggable LLM/VLM backends (ollama, Anthropic, Google, OpenAI)
+    evaluator.py        # Combined critic+refiner agent (with SAM3 point refinement)
+    loop.py             # Generate-evaluate-refine orchestrator
+    schemas.py          # Dataclasses for structured data exchange
   training/
     dataset.py     # CellMapFluxDataset: zarr-backed training data
     zarr_utils.py  # Zarr reading utilities (adapted from sam3m)
