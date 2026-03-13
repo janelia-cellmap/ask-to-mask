@@ -144,7 +144,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ref.add_argument(
         "--gen-backend",
         default="flux",
-        choices=["flux", "gemini", "glm", "qwen"],
+        choices=["flux", "gemini", "glm", "qwen", "sam3"],
         help="Image generation backend (default: flux).",
     )
     ref.add_argument(
@@ -172,7 +172,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ref.add_argument(
         "--llm-provider",
         default="google",
-        choices=["ollama", "anthropic", "google", "openai"],
+        choices=["ollama", "anthropic", "google", "openai", "huggingface"],
         help="LLM/VLM provider for evaluation (default: google).",
     )
     ref.add_argument("--llm-model", default=None, help="LLM model name.")
@@ -232,6 +232,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="overlay",
         choices=["overlay", "direct", "invert"],
         help="Mask extraction mode: 'overlay' colors organelles on the EM image; 'direct' asks for white-on-black mask; 'invert' segments background/edges then inverts to get instances (default: overlay).",
+    )
+    # SAM3-specific arguments
+    ref.add_argument(
+        "--sam3-strategy",
+        default="text",
+        choices=["text", "vlm-coordinate", "painted-marker"],
+        help="SAM3 prompting strategy (default: text). Only used with --gen-backend sam3.",
+    )
+    ref.add_argument(
+        "--sam3-model",
+        default="facebook/sam3",
+        help="SAM3 HuggingFace model ID (default: facebook/sam3).",
+    )
+    ref.add_argument(
+        "--sam3-confidence",
+        type=float,
+        default=0.5,
+        help="SAM3 mask confidence threshold (default: 0.5).",
+    )
+    ref.add_argument(
+        "--marker-backend",
+        default=None,
+        choices=["flux", "gemini", "glm", "qwen"],
+        help="Gen backend for painting markers (only for --sam3-strategy painted-marker).",
     )
 
     # --- list-organelles ---
@@ -318,16 +342,43 @@ def cmd_refine(args: argparse.Namespace) -> None:
     llm_backend = create_llm_backend(args.llm_provider, **llm_kwargs)
 
     # Build gen backend
-    gen_backend = create_gen_backend(
-        args.gen_backend,
-        model_key=args.model,
-        lora_path=args.lora,
-        device=args.device,
-        organelle_rgb=organelle.rgb,
-        gcp_project=args.gcp_project,
-        gcp_location=args.gcp_location,
-        vertex_ai=args.vertex_ai,
-    )
+    if args.gen_backend == "sam3":
+        sam3_kwargs = {
+            "strategy": args.sam3_strategy,
+            "model_name": args.sam3_model,
+            "device": args.device,
+            "organelle_rgb": organelle.rgb,
+            "confidence_threshold": args.sam3_confidence,
+        }
+        if args.sam3_strategy == "vlm-coordinate":
+            sam3_kwargs["llm_backend"] = llm_backend
+        if args.sam3_strategy == "painted-marker":
+            if not args.marker_backend:
+                raise SystemExit(
+                    "Error: --marker-backend is required with --sam3-strategy painted-marker"
+                )
+            sam3_kwargs["marker_gen_backend"] = create_gen_backend(
+                args.marker_backend,
+                model_key=args.model,
+                lora_path=args.lora,
+                device=args.device,
+                organelle_rgb=organelle.rgb,
+                gcp_project=args.gcp_project,
+                gcp_location=args.gcp_location,
+                vertex_ai=args.vertex_ai,
+            )
+        gen_backend = create_gen_backend("sam3", **sam3_kwargs)
+    else:
+        gen_backend = create_gen_backend(
+            args.gen_backend,
+            model_key=args.model,
+            lora_path=args.lora,
+            device=args.device,
+            organelle_rgb=organelle.rgb,
+            gcp_project=args.gcp_project,
+            gcp_location=args.gcp_location,
+            vertex_ai=args.vertex_ai,
+        )
 
     em_image = load_em_image(args.input)
     instance = getattr(args, "instance", False)
@@ -356,6 +407,7 @@ def cmd_refine(args: argparse.Namespace) -> None:
         "glm": {"num_inference_steps": 50, "guidance_scale": 1.5},
         "gemini": {"num_inference_steps": 28, "guidance_scale": 3.5},
         "qwen": {"num_inference_steps": 40, "guidance_scale": 1.0},
+        "sam3": {"num_inference_steps": 1, "guidance_scale": 1.0},
     }
     defaults = BACKEND_DEFAULTS.get(args.gen_backend, {})
 
@@ -387,6 +439,16 @@ def cmd_refine(args: argparse.Namespace) -> None:
         param_kwargs["extra"]["true_cfg_scale"] = args.true_cfg_scale
         param_kwargs["extra"]["negative_prompt"] = " "
 
+    if args.gen_backend == "sam3":
+        param_kwargs["strength"] = None
+        param_kwargs["extra"]["sam3_confidence_threshold"] = args.sam3_confidence
+        param_kwargs["extra"]["sam3_strategy"] = args.sam3_strategy
+        param_kwargs["extra"]["organelle_name"] = organelle.name
+        param_kwargs["extra"]["color_name"] = organelle.color_name
+        # For text mode, use the organelle name as the prompt
+        if args.sam3_strategy == "text":
+            param_kwargs["prompt"] = organelle.name
+
     initial_params = GenerationParams(**param_kwargs)
 
     config = LoopConfig(
@@ -400,6 +462,8 @@ def cmd_refine(args: argparse.Namespace) -> None:
 
     if args.gen_backend == "flux":
         gen_model_name = args.model
+    elif args.gen_backend == "sam3":
+        gen_model_name = f"sam3-{args.sam3_strategy}"
     else:
         gen_model_name = getattr(gen_backend, "model", args.gen_backend)
     eval_model_name = getattr(llm_backend, "model", args.llm_provider)
@@ -432,6 +496,7 @@ def cmd_refine(args: argparse.Namespace) -> None:
         mask_mode=mask_mode,
         gen_model=gen_model_name,
         resolution_nm=resolution_nm,
+        llm_model=getattr(args, "llm_model", "") or "",
     )
 
     if result.converged:

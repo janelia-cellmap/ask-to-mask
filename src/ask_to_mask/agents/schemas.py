@@ -45,6 +45,15 @@ class DetailedScores:
 
 
 @dataclass
+class PointRefinement:
+    """Suggested point coordinate adjustments from evaluator for SAM3."""
+
+    add_points: list[dict]  # [{"x": int, "y": int, "label": 1 (fg) or 0 (bg)}]
+    remove_indices: list[int]  # indices of existing points to remove
+    reasoning: str
+
+
+@dataclass
 class EvaluationResult:
     """Combined critique + refinement output from the evaluator agent."""
 
@@ -56,3 +65,5 @@ class EvaluationResult:
     should_stop: bool
     reasoning: str
     raw_response: str
+    point_refinement: PointRefinement | None = None
+    vlm_prompts: dict | None = None  # {"system": str, "user": str} sent to VLM

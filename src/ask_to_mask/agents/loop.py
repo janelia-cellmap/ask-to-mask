@@ -12,7 +12,7 @@ from ..config import OrganelleClass
 from .evaluator import EvaluatorAgent
 from .gen_backend import ImageGenBackend
 from .llm_backend import LLMBackend, images_to_composite
-from .schemas import EvaluationResult, GenerationParams, GenerationResult
+from .schemas import EvaluationResult, GenerationParams, GenerationResult, PointRefinement
 
 
 # The tunable numeric parameters and their allowed ranges, per backend
@@ -31,6 +31,7 @@ TUNABLE_PARAMS_BY_BACKEND = {
         "num_inference_steps": (20, 80),
     },
     "gemini": {},  # No tunable numeric params
+    "sam3": {},  # Refinement via prompt/points, not numeric params
 }
 
 # How much to change a parameter per step (fraction of current value)
@@ -45,7 +46,10 @@ def _backend_name(gen_backend: ImageGenBackend) -> str:
         GLMImageBackend,
         QwenImageEditBackend,
     )
+    from .sam3_backend import SAM3Backend
 
+    if isinstance(gen_backend, SAM3Backend):
+        return "sam3"
     if isinstance(gen_backend, FluxBackend):
         return "flux"
     if isinstance(gen_backend, GLMImageBackend):
@@ -91,6 +95,7 @@ def run_refinement_loop(
     mask_mode: str = "overlay",
     gen_model: str = "",
     resolution_nm: float | None = None,
+    llm_model: str = "",
 ) -> LoopResult:
     """Run the generate-evaluate-refine loop.
 
@@ -103,13 +108,37 @@ def run_refinement_loop(
         instance=instance,
         gen_model=gen_model,
         resolution_nm=resolution_nm,
+        llm_model=llm_model,
     )
 
-    # Use VLM to generate the initial prompt
-    print("\n=== Generating initial prompt via VLM ===")
-    initial_prompt = evaluator.generate_initial_prompt(em_image, organelle, mask_mode)
-    print(f"  Initial prompt: {initial_prompt}")
-    initial_params = _with_prompt(initial_params, initial_prompt)
+    # Check if this is a SAM3 point-based strategy
+    sam3_strategy = initial_params.extra.get("sam3_strategy")
+    use_points = sam3_strategy == "vlm-coordinate"
+
+    use_sam3_text = sam3_strategy == "text"
+
+    if use_points:
+        # Generate initial point coordinates via VLM
+        print("\n=== Generating initial points via VLM ===")
+        points = evaluator.generate_initial_points(em_image, organelle)
+        print(f"  Initial points: {len(points)} locations")
+        for p in points:
+            print(f"    ({p['x']}, {p['y']}) label={p.get('label', 1)}")
+        initial_params = _with_extra(
+            initial_params, {**initial_params.extra, "points": points}
+        )
+    elif use_sam3_text:
+        # SAM3 text mode: build a list of short candidate prompts to try
+        # across iterations (SAM3 expects simple terms, not sentences)
+        sam3_prompts = _sam3_candidate_prompts(organelle)
+        print(f"\n=== SAM3 text mode — candidates: {sam3_prompts} ===")
+        initial_params = _with_prompt(initial_params, sam3_prompts[0])
+    else:
+        # Use VLM to generate the initial prompt
+        print("\n=== Generating initial prompt via VLM ===")
+        initial_prompt = evaluator.generate_initial_prompt(em_image, organelle, mask_mode)
+        print(f"  Initial prompt: {initial_prompt}")
+        initial_params = _with_prompt(initial_params, initial_prompt)
 
     current_params = initial_params
     all_results: list[GenerationResult] = []
@@ -154,6 +183,8 @@ def run_refinement_loop(
                 instance=instance,
                 mask_mode=mask_mode,
             )
+        except (ImportError, ModuleNotFoundError):
+            raise
         except Exception as e:
             print(f"  Generation failed: {e}")
             # Save params so we know what was attempted
@@ -174,6 +205,7 @@ def run_refinement_loop(
                         raw_response="",
                     ),
                     current_params,
+                    init_vlm_prompts=evaluator.last_init_vlm_prompts if iteration == 0 else None,
                 )
             continue
         all_results.append(result)
@@ -183,7 +215,12 @@ def run_refinement_loop(
             _save_iteration(output_dir, iteration, result, em_image)
 
         # Step 2: Evaluate
-        evaluation = evaluator.evaluate_and_refine(em_image, result, organelle, history)
+        if use_points:
+            evaluation = evaluator.evaluate_and_refine_with_points(
+                em_image, result, organelle, history
+            )
+        else:
+            evaluation = evaluator.evaluate_and_refine(em_image, result, organelle, history)
         all_evaluations.append(evaluation)
         history.append((current_params, evaluation))
 
@@ -210,6 +247,7 @@ def run_refinement_loop(
                 evaluation,
                 current_params,
                 param_effects[-1] if param_effects else None,
+                init_vlm_prompts=evaluator.last_init_vlm_prompts if iteration == 0 else None,
             )
 
         # Step 3: Check if good enough
@@ -233,9 +271,26 @@ def run_refinement_loop(
 
         # Step 4b: Apply prompt refinement
         next_params = _copy_params(current_params)
-        if evaluation.refined_prompt:
+        if use_sam3_text:
+            # Cycle through candidate prompts
+            next_prompt_idx = (iteration + 1) % len(sam3_prompts)
+            next_params = _with_prompt(next_params, sam3_prompts[next_prompt_idx])
+            print(f"  Next SAM3 prompt: {sam3_prompts[next_prompt_idx]}")
+        elif evaluation.refined_prompt:
             next_params = _with_prompt(next_params, evaluation.refined_prompt)
             print(f"  Refined prompt: {next_params.prompt}")
+
+        # Step 4c: Apply point refinement (SAM3 coordinate mode)
+        if evaluation.point_refinement:
+            next_params = _apply_point_refinement(next_params, evaluation.point_refinement)
+            n_pts = len(next_params.extra.get("points", []))
+            pr = evaluation.point_refinement
+            print(
+                f"  Points updated: +{len(pr.add_points)} "
+                f"-{len(pr.remove_indices)} → {n_pts} total"
+            )
+            if pr.reasoning:
+                print(f"  Point reasoning: {pr.reasoning}")
 
         if not param_names:
             # No tunable params (e.g. Gemini) — only prompt refinement
@@ -355,6 +410,35 @@ def run_refinement_loop(
     )
 
 
+def _sam3_candidate_prompts(organelle: OrganelleClass) -> list[str]:
+    """Build a list of short text prompts for SAM3 open-vocabulary segmentation."""
+    # SAM3 expects concise terms, not editing instructions
+    prompts = [organelle.name]
+    # Add morphological synonyms per organelle
+    _SYNONYMS: dict[str, list[str]] = {
+        "mito": ["oval", "circle", "organelle", "mitochondrion", "ellipse"],
+        "er": ["membrane", "tubule", "network", "reticulum"],
+        "nucleus": ["nucleus", "oval", "circle", "cell nucleus"],
+        "lipid_droplet": ["droplet", "sphere", "circle", "vesicle"],
+        "plasma_membrane": ["membrane", "cell boundary", "border"],
+        "nuclear_envelope": ["nuclear membrane", "membrane", "envelope"],
+        "nuclear_pore": ["pore", "ring", "dot"],
+        "nucleolus": ["nucleolus", "sphere", "dense body"],
+        "heterochromatin": ["dark region", "dense chromatin", "chromatin"],
+        "euchromatin": ["light region", "diffuse chromatin", "chromatin"],
+        "cell": ["cell", "oval", "blob"],
+    }
+    prompts.extend(_SYNONYMS.get(organelle.key, []))
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    unique: list[str] = []
+    for p in prompts:
+        if p not in seen:
+            seen.add(p)
+            unique.append(p)
+    return unique
+
+
 def _get_param(params: GenerationParams, name: str) -> float:
     """Get a parameter value by name."""
     return float(getattr(params, name))
@@ -430,6 +514,45 @@ def _revert_param(
     return _with_param(params, name, effect["old_value"])
 
 
+def _with_extra(params: GenerationParams, extra: dict) -> GenerationParams:
+    """Return a copy of params with updated extra dict."""
+    return GenerationParams(
+        prompt=params.prompt,
+        num_inference_steps=params.num_inference_steps,
+        guidance_scale=params.guidance_scale,
+        strength=params.strength,
+        seed=params.seed,
+        threshold=params.threshold,
+        extra=extra,
+    )
+
+
+def _apply_point_refinement(
+    params: GenerationParams, refinement: PointRefinement
+) -> GenerationParams:
+    """Apply point additions/removals from evaluator feedback."""
+    current_points = list(params.extra.get("points", []))
+
+    # Remove points by index (in reverse order to preserve indices)
+    for idx in sorted(refinement.remove_indices, reverse=True):
+        if 0 <= idx < len(current_points):
+            current_points.pop(idx)
+
+    # Add new points, ensuring foreground points have instance IDs
+    max_instance = max(
+        (p.get("instance", -1) for p in current_points if p.get("label", 1) == 1),
+        default=-1,
+    )
+    for p in refinement.add_points:
+        if p.get("label", 1) == 1 and "instance" not in p:
+            max_instance += 1
+            p["instance"] = max_instance
+        current_points.append(p)
+
+    new_extra = {**params.extra, "points": current_points}
+    return _with_extra(params, new_extra)
+
+
 def _save_iteration(
     output_dir: Path, iteration: int, result: GenerationResult, em_image: Image.Image
 ) -> None:
@@ -441,6 +564,59 @@ def _save_iteration(
     composite = images_to_composite(em_image, result.colored_image, result.mask_image)
     composite.save(iter_dir / "composite.png")
 
+    # Save point visualization if points were used
+    points = result.params_used.extra.get("points")
+    if points:
+        points_img = _draw_points_on_image(em_image, points)
+        points_img.save(iter_dir / "points.png")
+
+
+def _draw_points_on_image(
+    em_image: Image.Image, points: list[dict]
+) -> Image.Image:
+    """Draw point prompts on the EM image, color-coded by instance ID."""
+    from PIL import ImageDraw
+
+    # Distinct colors for instances (cycle if more than 10)
+    INSTANCE_COLORS = [
+        (0, 255, 0), (0, 200, 255), (255, 255, 0), (255, 0, 255),
+        (255, 165, 0), (0, 255, 200), (200, 100, 255), (100, 255, 100),
+        (255, 200, 100), (100, 200, 255),
+    ]
+    BG_COLOR = (255, 0, 0)  # red for background points
+
+    img = em_image.convert("RGB").copy()
+    draw = ImageDraw.Draw(img)
+    # Scale radius to image size — at least 6px, up to ~2% of the shorter side
+    radius = max(6, min(img.width, img.height) // 50)
+
+    for i, p in enumerate(points):
+        x, y = p["x"], p["y"]
+        label = p.get("label", 1)
+        if label == 1:
+            inst_id = p.get("instance", i)
+            color = INSTANCE_COLORS[inst_id % len(INSTANCE_COLORS)]
+        else:
+            color = BG_COLOR
+        draw.ellipse(
+            [x - radius, y - radius, x + radius, y + radius],
+            fill=color,
+            outline=(255, 255, 255),
+            width=max(1, radius // 4),
+        )
+        # Label: "index:instance" for fg, just index for bg
+        if label == 1:
+            label_text = f"{i}:i{p.get('instance', i)}"
+        else:
+            label_text = f"{i}:bg"
+        draw.text(
+            (x + radius + 2, y - radius),
+            label_text,
+            fill=(255, 255, 255),
+        )
+
+    return img
+
 
 def _save_evaluation(
     output_dir: Path,
@@ -448,25 +624,44 @@ def _save_evaluation(
     evaluation: EvaluationResult,
     params: GenerationParams,
     param_change: dict | None = None,
+    init_vlm_prompts: dict | None = None,
 ) -> None:
-    """Save evaluation results as JSON."""
+    """Save generation + evaluation results as JSON."""
     iter_dir = output_dir / f"iteration_{iteration:02d}"
     iter_dir.mkdir(parents=True, exist_ok=True)
 
-    params_used = {
-        "prompt": params.prompt,
-        "guidance_scale": params.guidance_scale,
-        "num_inference_steps": params.num_inference_steps,
-        "threshold": params.threshold,
-        "seed": params.seed,
-    }
-    if params.strength is not None:
-        params_used["strength"] = params.strength
+    sam3_strategy = params.extra.get("sam3_strategy")
 
-    data = {
+    # --- Generation section: what was used to produce the segmentation ---
+    generation: dict = {}
+
+    if sam3_strategy:
+        generation["sam3_strategy"] = sam3_strategy
+
+    if sam3_strategy in ("vlm-coordinate", "painted-marker"):
+        if "points" in params.extra:
+            generation["points"] = params.extra["points"]
+    else:
+        generation["prompt"] = params.prompt
+
+    generation["guidance_scale"] = params.guidance_scale
+    generation["num_inference_steps"] = params.num_inference_steps
+    generation["threshold"] = params.threshold
+    generation["seed"] = params.seed
+    if params.strength is not None:
+        generation["strength"] = params.strength
+
+    if param_change:
+        generation["param_change"] = param_change
+
+    # VLM prompts used to generate initial points or initial prompt (iteration 0)
+    if init_vlm_prompts:
+        generation["init_vlm_prompts"] = init_vlm_prompts
+
+    # --- Evaluation section: VLM critique of the result ---
+    eval_section: dict = {
         "score": evaluation.score,
         "detailed_scores": None,
-        "params_used": params_used,
         "issues": evaluation.issues,
         "reasoning": evaluation.reasoning,
         "refined_prompt": evaluation.refined_prompt,
@@ -474,7 +669,7 @@ def _save_evaluation(
 
     if evaluation.detailed_scores:
         ds = evaluation.detailed_scores
-        data["detailed_scores"] = {
+        eval_section["detailed_scores"] = {
             "tp_rate": ds.tp_rate,
             "fp_rate": ds.fp_rate,
             "fn_rate": ds.fn_rate,
@@ -482,8 +677,23 @@ def _save_evaluation(
             "dice_score": ds.dice_score,
         }
 
-    if param_change:
-        data["param_change"] = param_change
+    if evaluation.vlm_prompts:
+        eval_section["vlm_prompts"] = evaluation.vlm_prompts
+
+    if evaluation.point_refinement:
+        pr = evaluation.point_refinement
+        eval_section["point_refinement"] = {
+            "add_points": pr.add_points,
+            "remove_indices": pr.remove_indices,
+            "reasoning": pr.reasoning,
+        }
+
+    eval_section["raw_response"] = evaluation.raw_response
+
+    data = {
+        "generation": generation,
+        "evaluation": eval_section,
+    }
 
     with open(iter_dir / "evaluation.json", "w") as f:
         json.dump(data, f, indent=4)

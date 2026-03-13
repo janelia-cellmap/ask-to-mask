@@ -14,6 +14,7 @@ from .schemas import (
     EvaluationResult,
     GenerationParams,
     GenerationResult,
+    PointRefinement,
 )
 
 SYSTEM_PROMPT = """\
@@ -107,6 +108,64 @@ Respond with ONLY JSON:
 """
 
 
+VLM_INITIAL_POINTS_PROMPT = """\
+We segment organelles in electron microscopy (EM) images using SAM3 (Segment Anything Model 3) \
+with point prompts. You identify the approximate center locations of target organelles in the EM \
+image so we can feed those coordinates to SAM3.
+
+You will see the EM image. Identify each visible instance of the target organelle and provide \
+its approximate center (x, y) in pixel coordinates. The origin (0, 0) is the top-left corner. \
+x increases to the right, y increases downward.
+
+Provide foreground points (label=1) at organelle centers. If there are obvious non-organelle \
+regions that might confuse the model, you may also add background points (label=0).
+
+Assign each foreground point an instance ID (integer). Points with the same instance ID will be \
+used to segment the same object. Each distinct organelle should have a unique instance ID \
+(starting from 0). For large or elongated organelles, you may place multiple points on the same \
+instance. Background points (label=0) do not need an instance ID.
+
+Respond with ONLY JSON:
+{"points": [{"x": 100, "y": 200, "label": 1, "instance": 0}, {"x": 300, "y": 400, "label": 1, "instance": 1}], "reasoning": "why these points"}\
+"""
+
+SAM3_COORDINATE_SYSTEM_PROMPT = """\
+We segment organelles in electron microscopy (EM) images using SAM3 (Segment Anything Model 3) \
+with point prompts. You evaluate the segmentation result and suggest point coordinate adjustments.
+
+You receive two images: the FIRST is the original EM, the SECOND is the SAM3 mask output \
+(organelles colored on the EM background).
+
+You also receive the current point coordinates used for this iteration.
+
+Compare the two images carefully:
+1. Count how many organelles are CORRECTLY segmented vs how many are visible in the EM
+2. Check if NON-organelle areas are included (false positives)
+3. Check if boundaries are precise
+
+You MUST provide detailed sub-scores (all 0.0 to 1.0):
+- tp_rate, fp_rate, fn_rate, boundary_quality, dice_score (same as standard evaluation)
+
+Additionally, suggest point refinements:
+- add_points: new foreground (label=1) or background (label=0) points to improve the mask. \
+For foreground points, include an instance ID matching an existing instance or a new unique ID \
+for a newly detected organelle. Background points do not need an instance ID.
+- remove_indices: indices (0-based) of existing points that are causing problems
+
+Respond with ONLY JSON:
+{"score": 0.0-1.0, "detailed_scores": {"tp_rate": 0.8, "fp_rate": 0.1, "fn_rate": 0.2, "boundary_quality": 0.7, "dice_score": 0.6}, "issues": ["specific issue"], "refined_prompt": null, "param_adjustments": {}, "should_stop": false, "reasoning": "brief reason", "point_refinement": {"add_points": [{"x": 150, "y": 250, "label": 1, "instance": 2}], "remove_indices": [], "reasoning": "why these changes"}}\
+"""
+
+
+MOLMO_POINTS_PROMPT = """\
+You are analyzing an electron microscopy (EM) image. \
+Point to multiple locations spread across each visible {organelle} in this image. \
+For each {organelle}, point to its center AND several points along its edges and extent — \
+not just one center point. This is especially important for large or elongated structures. \
+Aim for 3-5 points per small organelle and more for larger ones.\
+"""
+
+
 class EvaluatorAgent:
     """Evaluates mask quality and refines prompts using a VLM backend."""
 
@@ -116,11 +175,15 @@ class EvaluatorAgent:
         instance: bool = False,
         gen_model: str = "",
         resolution_nm: float | None = None,
+        llm_model: str = "",
     ):
         self.backend = backend
         self.instance = instance
         self.gen_model = gen_model
         self.resolution_nm = resolution_nm
+        self.is_molmo = "molmo" in llm_model.lower()
+        # Stores VLM prompts used for the most recent initial generation call
+        self.last_init_vlm_prompts: dict | None = None
 
     def generate_initial_prompt(
         self,
@@ -149,6 +212,11 @@ class EvaluatorAgent:
         user_prompt = "\n".join(parts)
 
         raw = self.backend.chat_with_image(INITIAL_PROMPT_SYSTEM, user_prompt, em_image)
+        self.last_init_vlm_prompts = {
+            "system": INITIAL_PROMPT_SYSTEM,
+            "user": user_prompt,
+            "raw_response": raw[:2000],
+        }
         return self._parse_initial_prompt(raw, organelle)
 
     def _parse_initial_prompt(self, raw: str, organelle: OrganelleClass) -> str:
@@ -185,7 +253,275 @@ class EvaluatorAgent:
         raw = self.backend.chat_with_images(
             system, user_prompt, [em_image, result.colored_image]
         )
-        return self._parse_response(raw)
+        eval_result = self._parse_response(raw)
+        eval_result.vlm_prompts = {"system": system, "user": user_prompt}
+        return eval_result
+
+    def generate_initial_points(
+        self,
+        em_image: Image.Image,
+        organelle: OrganelleClass,
+    ) -> list[dict]:
+        """Ask the VLM to identify organelle locations as (x, y) point coordinates."""
+        if self.is_molmo:
+            return self._generate_initial_points_molmo(em_image, organelle)
+
+        w, h = em_image.size
+        parts = [
+            f"Target organelle: {organelle.name}.",
+            f"Image dimensions: {w} x {h} pixels.",
+        ]
+        if organelle.description:
+            parts.append(f"In EM, {organelle.name} appear as: {organelle.description}")
+        if self.resolution_nm is not None:
+            parts.append(f"Image resolution: {self.resolution_nm:.0f} nm/px.")
+        parts.append("\nIdentify each visible instance and provide center coordinates. Respond with JSON only.")
+        user_prompt = "\n".join(parts)
+
+        raw = self.backend.chat_with_image(VLM_INITIAL_POINTS_PROMPT, user_prompt, em_image)
+        self.last_init_vlm_prompts = {
+            "system": VLM_INITIAL_POINTS_PROMPT,
+            "user": user_prompt,
+            "raw_response": raw[:2000],
+        }
+        return self._parse_initial_points(raw, em_image)
+
+    def _parse_initial_points(self, raw: str, em_image: Image.Image) -> list[dict]:
+        """Extract point coordinates from the VLM's response."""
+        text = raw[:4000]
+        json_str = self._extract_json_object(text)
+        if json_str:
+            try:
+                parsed = json.loads(json_str)
+                points = parsed.get("points", [])
+                if points and isinstance(points, list):
+                    reasoning = parsed.get("reasoning", "")
+                    if reasoning:
+                        print(f"  VLM points reasoning: {reasoning}")
+                    # Validate and clamp coordinates
+                    w, h = em_image.size
+                    valid_points = []
+                    for i, p in enumerate(points):
+                        if isinstance(p, dict) and "x" in p and "y" in p:
+                            pt = {
+                                "x": max(0, min(w - 1, int(p["x"]))),
+                                "y": max(0, min(h - 1, int(p["y"]))),
+                                "label": int(p.get("label", 1)),
+                            }
+                            # Preserve instance ID; default to index if omitted
+                            if pt["label"] == 1:
+                                pt["instance"] = int(p.get("instance", i))
+                            valid_points.append(pt)
+                    return valid_points
+            except json.JSONDecodeError:
+                pass
+
+        # Fallback: try to extract points with regex (JSON dict format)
+        point_matches = re.findall(
+            r'\{\s*"x"\s*:\s*(\d+)\s*,\s*"y"\s*:\s*(\d+)(?:\s*,\s*"label"\s*:\s*(\d+))?\s*\}',
+            text,
+        )
+        if point_matches:
+            w, h = em_image.size
+            result = []
+            for i, m in enumerate(point_matches):
+                pt = {
+                    "x": max(0, min(w - 1, int(m[0]))),
+                    "y": max(0, min(h - 1, int(m[1]))),
+                    "label": int(m[2]) if m[2] else 1,
+                }
+                if pt["label"] == 1:
+                    pt["instance"] = i  # default: each point is its own instance
+                result.append(pt)
+            return result
+
+        # Fallback: tuple format like (10, 65), (15, 60) — e.g. from Molmo text mode
+        # Group by line: points on the same line (e.g. "Boat 1: (10, 65), (15, 60)")
+        # belong to the same instance
+        w, h = em_image.size
+        tuple_points: list[dict] = []
+        instance_id = 0
+        for line in text.split("\n"):
+            line_matches = re.findall(r'\(\s*(\d+)\s*,\s*(\d+)\s*\)', line)
+            if line_matches:
+                for m in line_matches:
+                    tuple_points.append({
+                        "x": max(0, min(w - 1, int(m[0]))),
+                        "y": max(0, min(h - 1, int(m[1]))),
+                        "label": 1,
+                        "instance": instance_id,
+                    })
+                instance_id += 1
+        if tuple_points:
+            print(f"  Parsed {len(tuple_points)} points from tuple format ({instance_id} instances)")
+            return tuple_points
+
+        print("  Warning: could not parse VLM points, using image center as fallback")
+        return [{"x": w // 2, "y": h // 2, "label": 1, "instance": 0}]
+
+    def _generate_initial_points_molmo(
+        self, em_image: Image.Image, organelle: OrganelleClass
+    ) -> list[dict]:
+        """Use Molmo's native pointing capability to locate organelles."""
+        system_prompt = MOLMO_POINTS_PROMPT.format(organelle=organelle.name)
+        user_prompt = (
+            f"Point to multiple locations spread across each {organelle.name} in this image — "
+            f"center, edges, and along the extent of each one."
+        )
+        if organelle.description:
+            user_prompt += f" They appear as: {organelle.description}"
+
+        raw = self.backend.chat_with_image(system_prompt, user_prompt, em_image)
+        self.last_init_vlm_prompts = {
+            "system": system_prompt,
+            "user": user_prompt,
+            "raw_response": raw[:2000],
+        }
+        print(f"  Molmo raw response: {raw[:500]}")
+        return self._parse_molmo_points(raw, em_image)
+
+    def _parse_molmo_points(self, raw: str, em_image: Image.Image) -> list[dict]:
+        """Parse Molmo2's point output to pixel coordinates.
+
+        Molmo2 uses a coords-based format with coordinates scaled by 1000:
+          <points ... coords="1 0 523 412"/>  (frame_id idx x*1000 y*1000)
+        Also handles legacy Molmo1 format (0-100 normalized):
+          <point x="56.2" y="32.7" alt="desc">
+          <points x1="26.0" y1="67.5" x2="44.2" y2="40.5" ...>
+
+        Each point is assigned its own unique instance ID.
+        """
+        w, h = em_image.size
+        points: list[dict] = []
+
+        # Molmo2 coords format: <points ... coords="1 0 523 412"/> or similar
+        # Pattern: "idx x y" where x,y are 3-4 digit numbers (scaled by 1000)
+        coord_regex = re.compile(r'coords="([^"]+)"')
+        points_num_regex = re.compile(r"(\d+)\s+(\d{3,4})\s+(\d{3,4})")
+        for coord_match in coord_regex.finditer(raw):
+            coord_str = coord_match.group(1)
+            for m in points_num_regex.finditer(coord_str):
+                px_x = max(0, min(w - 1, int(float(m.group(2)) / 1000 * w)))
+                px_y = max(0, min(h - 1, int(float(m.group(3)) / 1000 * h)))
+                points.append({"x": px_x, "y": px_y, "label": 1})
+
+        if points:
+            print(f"  Molmo2 detected {len(points)} points (coords format)")
+            return self._assign_instance_ids(points)
+
+        # Legacy Molmo1: multi-point format <points x1="26.0" y1="67.5" ...>
+        points_tag = re.search(r"<points\s+([^>]+)>", raw)
+        if points_tag:
+            attrs = points_tag.group(1)
+            xs = re.findall(r'x(\d+)\s*=\s*"([^"]+)"', attrs)
+            ys = re.findall(r'y(\d+)\s*=\s*"([^"]+)"', attrs)
+            y_map = {idx: val for idx, val in ys}
+            for idx, x_val in xs:
+                if idx in y_map:
+                    px_x = max(0, min(w - 1, int(float(x_val) * w / 100)))
+                    px_y = max(0, min(h - 1, int(float(y_map[idx]) * h / 100)))
+                    points.append({"x": px_x, "y": px_y, "label": 1})
+
+        # Legacy Molmo1: single-point format <point x="56.2" y="32.7" ...>
+        for m in re.finditer(r'<point\s+x\s*=\s*"([^"]+)"\s+y\s*=\s*"([^"]+)"', raw):
+            px_x = max(0, min(w - 1, int(float(m.group(1)) * w / 100)))
+            px_y = max(0, min(h - 1, int(float(m.group(2)) * h / 100)))
+            points.append({"x": px_x, "y": px_y, "label": 1})
+
+        if points:
+            print(f"  Molmo detected {len(points)} points (legacy format)")
+            return self._assign_instance_ids(points)
+
+        print("  Warning: could not parse Molmo points, using image center as fallback")
+        print(f"  Raw response: {raw[:500]}")
+        return [{"x": w // 2, "y": h // 2, "label": 1, "instance": 0}]
+
+    @staticmethod
+    def _assign_instance_ids(points: list[dict]) -> list[dict]:
+        """Assign each point its own unique instance ID."""
+        return [{**p, "instance": i} for i, p in enumerate(points)]
+
+    def evaluate_and_refine_with_points(
+        self,
+        em_image: Image.Image,
+        result: GenerationResult,
+        organelle: OrganelleClass,
+        history: list[tuple[GenerationParams, EvaluationResult]] | None = None,
+    ) -> EvaluationResult:
+        """Evaluate SAM3 mask and suggest point coordinate refinements."""
+        user_prompt = self._build_user_prompt_with_points(result, organelle, history)
+        raw = self.backend.chat_with_images(
+            SAM3_COORDINATE_SYSTEM_PROMPT, user_prompt, [em_image, result.colored_image]
+        )
+        eval_result = self._parse_response_with_points(raw)
+        eval_result.vlm_prompts = {"system": SAM3_COORDINATE_SYSTEM_PROMPT, "user": user_prompt}
+        return eval_result
+
+    def _build_user_prompt_with_points(
+        self,
+        result: GenerationResult,
+        organelle: OrganelleClass,
+        history: list[tuple[GenerationParams, EvaluationResult]] | None,
+    ) -> str:
+        w, h = result.input_image.size
+        parts = [
+            f"The first image is the original EM ({w}x{h}). The second image is the SAM3 {organelle.name} segmentation mask.",
+            f"Evaluate the {organelle.name} segmentation quality.",
+        ]
+        if organelle.description:
+            parts.append(f"In EM, {organelle.name} appear as: {organelle.description}")
+        if self.resolution_nm is not None:
+            parts.append(f"Image resolution: {self.resolution_nm:.0f} nm/px.")
+
+        # Show current points
+        current_points = result.params_used.extra.get("points", [])
+        if current_points:
+            def _fmt_pt(i: int, p: dict) -> str:
+                s = f"[{i}] ({p['x']}, {p['y']}) label={p.get('label', 1)}"
+                if p.get("label", 1) == 1:
+                    s += f" instance={p.get('instance', '?')}"
+                return s
+            pts_str = ", ".join(_fmt_pt(i, p) for i, p in enumerate(current_points))
+            parts.append(f"\nCurrent points ({len(current_points)}): {pts_str}")
+
+        parts.append(f"Iteration {result.iteration + 1}.")
+
+        if history:
+            parts.append("\nPrevious attempts:")
+            for i, (params, eval_result) in enumerate(history):
+                scores_str = ""
+                if eval_result.detailed_scores:
+                    ds = eval_result.detailed_scores
+                    scores_str = f"dice={ds.dice_score:.2f}"
+                else:
+                    scores_str = f"score={eval_result.score:.2f}"
+                n_pts = len(params.extra.get("points", []))
+                parts.append(f"  #{i+1}: {scores_str}, {n_pts} points, issues={eval_result.issues}")
+
+        parts.append("\nRespond with JSON only (include point_refinement).")
+        return "\n".join(parts)
+
+    def _parse_response_with_points(self, raw: str) -> EvaluationResult:
+        """Parse evaluation response that includes point refinement data."""
+        base_result = self._parse_response(raw)
+
+        # Try to extract point_refinement from the raw response
+        text = raw[:4000]
+        json_str = self._extract_json_object(text)
+        if json_str:
+            try:
+                parsed = json.loads(json_str)
+                pr = parsed.get("point_refinement")
+                if isinstance(pr, dict):
+                    base_result.point_refinement = PointRefinement(
+                        add_points=pr.get("add_points", []),
+                        remove_indices=pr.get("remove_indices", []),
+                        reasoning=pr.get("reasoning", ""),
+                    )
+            except json.JSONDecodeError:
+                pass
+
+        return base_result
 
     @staticmethod
     def _extract_json_object(text: str) -> str | None:
