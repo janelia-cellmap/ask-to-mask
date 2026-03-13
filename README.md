@@ -217,6 +217,7 @@ The VLM-coordinate strategy also supports a HuggingFace backend (`--llm-provider
 
 Output intermediates include `colored.png` (semi-transparent overlay of instance masks on the EM image), `mask.png` (color-coded instance labels), `points.png` (point prompts visualized on the EM), and `evaluation.json`.
 
+
 ## LoRA finetuning
 
 Finetune Flux on annotated CellMap EM data to improve organelle recognition.
