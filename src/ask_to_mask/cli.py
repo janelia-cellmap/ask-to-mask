@@ -29,6 +29,51 @@ _load_dotenv()
 from .config import DEFAULT_MODEL, MODELS, ORGANELLES
 
 
+def _load_yaml_config(config_path: Path) -> dict:
+    """Load a YAML config file and return a flat dict of CLI-compatible keys."""
+    import yaml
+
+    with open(config_path) as f:
+        raw = yaml.safe_load(f) or {}
+
+    # Flatten nested dicts with underscore joining (e.g., zarr.path -> zarr_path)
+    flat = {}
+    for key, val in raw.items():
+        if isinstance(val, dict):
+            for sub_key, sub_val in val.items():
+                flat[f"{key}_{sub_key}"] = sub_val
+        else:
+            flat[key] = val
+
+    # Normalize key names: dashes to underscores
+    return {k.replace("-", "_"): v for k, v in flat.items()}
+
+
+def _merge_config_with_args(
+    args: argparse.Namespace, config: dict, argv: list[str] | None = None,
+) -> argparse.Namespace:
+    """Merge YAML config values into args, CLI flags take precedence.
+
+    Determines which args were explicitly set on the CLI by checking which
+    ``--flag`` names appear in ``argv``.  Config values only override args
+    that were NOT explicitly provided on the command line.
+    """
+    # Build set of arg names explicitly passed on CLI
+    explicit: set[str] = set()
+    if argv is None:
+        argv = sys.argv[1:]
+    for token in argv:
+        if token.startswith("--"):
+            name = token.lstrip("-").split("=")[0].replace("-", "_")
+            explicit.add(name)
+
+    for key, val in config.items():
+        if key in explicit:
+            continue  # CLI flag takes precedence
+        setattr(args, key, val)
+    return args
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="ask-to-mask",
@@ -38,22 +83,53 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     # --- segment ---
     seg = sub.add_parser("segment", help="Segment organelles in EM images.")
-    input_group = seg.add_mutually_exclusive_group(required=True)
+    seg.add_argument("--config", type=Path, default=None, help="YAML config file (CLI flags override config values).")
+    input_group = seg.add_mutually_exclusive_group(required=False)  # config can provide input
     input_group.add_argument("--input", type=Path, help="Path to a single EM image.")
     input_group.add_argument(
         "--input-dir", type=Path, help="Directory of EM images for batch processing."
+    )
+    input_group.add_argument(
+        "--zarr-path", type=str, help="Path to a zarr volume or group."
+    )
+
+    # Zarr-specific arguments (only used with --zarr-path)
+    seg.add_argument(
+        "--dataset-path",
+        type=str,
+        default=None,
+        help="Sub-path within the zarr (e.g., 's0'). Omit if --zarr-path points directly to the array.",
+    )
+    seg.add_argument("--z-start", type=int, default=0, help="First Z slice index (default: 0).")
+    seg.add_argument("--z-count", type=int, default=1, help="Number of Z slices to process (default: 1).")
+    seg.add_argument("--z-step", type=int, default=1, help="Step between Z slices (default: 1).")
+    seg.add_argument(
+        "--roi",
+        type=str,
+        default=None,
+        help="ROI in world coordinates (nm), e.g. '[500:1000,500:1000,1000:11000]'. Overrides z-start/z-count/z-step.",
+    )
+    seg.add_argument(
+        "--z-step-nm", type=float, default=None,
+        help="Z spacing in nm when using --roi. E.g. 40 reads every 40 nm. Default: every voxel.",
+    )
+    seg.add_argument(
+        "--save-zarr",
+        type=str,
+        default=None,
+        help="Path to save 3D mask stack as zarr (only with --zarr-path and z-count > 1).",
     )
 
     seg.add_argument(
         "--output-dir",
         type=Path,
-        required=True,
+        default=None,
         help="Directory to save output masks.",
     )
     seg.add_argument(
         "--organelles",
         nargs="+",
-        required=True,
+        default=None,
         choices=list(ORGANELLES.keys()),
         help="Organelle classes to segment.",
     )
@@ -128,16 +204,63 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "refine",
         help="Iteratively refine mask quality using a VLM evaluator agent.",
     )
-    ref.add_argument("--input", type=Path, required=True, help="Path to an EM image.")
+    ref.add_argument("--config", type=Path, default=None, help="YAML config file (CLI flags override config values).")
+    ref_input = ref.add_mutually_exclusive_group(required=False)  # config can provide input
+    ref_input.add_argument("--input", type=Path, help="Path to an EM image.")
+    ref_input.add_argument("--zarr-path", type=str, help="Path to a zarr volume or group.")
+
+    # Zarr-specific arguments (only used with --zarr-path)
+    ref.add_argument(
+        "--dataset-path",
+        type=str,
+        default=None,
+        help="Sub-path within the zarr (e.g., 's0').",
+    )
+    ref.add_argument("--z-start", type=int, default=0, help="First Z slice index (default: 0).")
+    ref.add_argument("--z-count", type=int, default=1, help="Number of Z slices (default: 1).")
+    ref.add_argument("--z-step", type=int, default=1, help="Step between Z slices (default: 1).")
+    ref.add_argument(
+        "--roi",
+        type=str,
+        default=None,
+        help="ROI in world coordinates (nm), e.g. '[500:1000,500:1000,1000:11000]'. Overrides z-start/z-count/z-step.",
+    )
+    ref.add_argument(
+        "--z-step-nm", type=float, default=None,
+        help="Z spacing in nm when using --roi. E.g. 40 reads every 40 nm. Default: every voxel.",
+    )
+    ref.add_argument(
+        "--save-zarr",
+        type=str,
+        default=None,
+        help="Path to save 3D mask stack as zarr.",
+    )
+    # Z-stack SAM3 options
+    ref.add_argument(
+        "--use-video-predictor",
+        action="store_true",
+        help="Enable SAM3 video predictor for z-stack mask propagation (only with --gen-backend sam3).",
+    )
+    ref.add_argument(
+        "--multi-slice-points",
+        action="store_true",
+        help="Run Molmo on each slice independently to find points.",
+    )
+    ref.add_argument(
+        "--point-sample",
+        type=int,
+        default=None,
+        help="Number of slices to sample for Molmo point detection (default: all).",
+    )
     ref.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("outputs"),
+        default=None,
         help="Directory to save results.",
     )
     ref.add_argument(
         "--organelle",
-        required=True,
+        default=None,
         choices=list(ORGANELLES.keys()),
         help="Organelle class to segment.",
     )
@@ -176,6 +299,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="LLM/VLM provider for evaluation (default: google).",
     )
     ref.add_argument("--llm-model", default=None, help="LLM model name.")
+    ref.add_argument(
+        "--point-provider",
+        default=None,
+        choices=["ollama", "anthropic", "google", "openai", "huggingface"],
+        help="VLM provider for point detection (default: same as --llm-provider).",
+    )
+    ref.add_argument("--point-model", default=None, help="VLM model for point detection (e.g. allenai/Molmo2-8B).")
+    ref.add_argument("--point-prompt", default=None, help="Custom prompt for Molmo point detection (default: 'Point to the {organelle}').")
+    ref.add_argument(
+        "--skip-refinement",
+        action="store_true",
+        help="Skip the iterative evaluation/refinement loop. Just detect points and run SAM3 once.",
+    )
     ref.add_argument(
         "--ollama-host",
         default="http://localhost:11434",
@@ -273,25 +409,25 @@ def cmd_list_organelles() -> None:
 
 
 def cmd_segment(args: argparse.Namespace) -> None:
+    # Merge YAML config if provided
+    if args.config:
+        config = _load_yaml_config(args.config)
+        args = _merge_config_with_args(args, config)
+
+    # Validate required args (may come from config)
+    if not args.input and not args.input_dir and not getattr(args, "zarr_path", None):
+        raise SystemExit("Error: one of --input, --input-dir, --zarr-path is required (or set in --config)")
+    if not args.output_dir:
+        raise SystemExit("Error: --output-dir is required (or set in --config)")
+    if not args.organelles:
+        raise SystemExit("Error: --organelles is required (or set in --config)")
+    args.output_dir = Path(args.output_dir) if isinstance(args.output_dir, str) else args.output_dir
+
     from .model import load_pipeline
     from .pipeline import segment
 
     print(f"Loading model: {args.model} ({MODELS[args.model]})")
     pipe = load_pipeline(args.model, device=args.device, lora_weights=args.lora)
-
-    # Collect image paths
-    if args.input:
-        image_paths = [args.input]
-    else:
-        exts = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
-        image_paths = sorted(
-            p for p in args.input_dir.iterdir() if p.suffix.lower() in exts
-        )
-        if not image_paths:
-            print(f"No images found in {args.input_dir}")
-            sys.exit(1)
-
-    print(f"Processing {len(image_paths)} image(s) for organelles: {args.organelles}")
 
     kwargs = dict(
         model_key=args.model,
@@ -307,16 +443,86 @@ def cmd_segment(args: argparse.Namespace) -> None:
         resolution_nm=args.resolution,
     )
 
-    for path in image_paths:
-        print(f"\n--- {path.name} ---")
-        masks = segment(pipe, path, args.organelles, args.output_dir, **kwargs)
-        for m in masks:
-            print(f"  Saved: {m}")
+    if getattr(args, "zarr_path", None):
+        from .zarr_io import get_zarr_info, load_zarr_zstack, parse_roi, save_masks_to_zarr
 
-    print("\nDone.")
+        import numpy as np
+
+        roi = parse_roi(args.roi) if getattr(args, "roi", None) else None
+        info = get_zarr_info(args.zarr_path, args.dataset_path)
+        print(f"Zarr volume: {args.zarr_path} {info}")
+        if roi:
+            print(f"  ROI (nm): {roi}")
+        slices = load_zarr_zstack(
+            args.zarr_path, args.dataset_path,
+            roi=roi, z_step_nm=getattr(args, "z_step_nm", None),
+            z_start=args.z_start, z_count=args.z_count, z_step=args.z_step,
+        )
+        if roi:
+            z_indices = list(range(len(slices)))
+        else:
+            z_indices = list(range(args.z_start, args.z_start + args.z_count * args.z_step, args.z_step))
+        print(f"Processing {len(slices)} slice(s) for organelles: {args.organelles}")
+
+        all_masks = []  # for zarr output: list of (Z, H, W) per organelle
+        for i, (sl, z_idx) in enumerate(zip(slices, z_indices)):
+            stem = f"z{z_idx:04d}"
+            print(f"\n--- slice {z_idx} ({i+1}/{len(slices)}) ---")
+            masks = segment(
+                pipe, None, args.organelles, args.output_dir,
+                image=sl, image_stem=stem, **kwargs,
+            )
+            for m in masks:
+                print(f"  Saved: {m}")
+
+        if args.save_zarr and args.z_count > 1:
+            # Collect masks per organelle and save as zarr
+            from .pipeline import segment_single, load_em_image
+            print(f"\nNote: --save-zarr writes masks from the per-slice PNGs above.")
+            print(f"  Zarr output: {args.save_zarr}")
+
+        print("\nDone.")
+    else:
+        # Existing image file path(s)
+        if args.input:
+            image_paths = [args.input]
+        else:
+            exts = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
+            image_paths = sorted(
+                p for p in args.input_dir.iterdir() if p.suffix.lower() in exts
+            )
+            if not image_paths:
+                print(f"No images found in {args.input_dir}")
+                sys.exit(1)
+
+        print(f"Processing {len(image_paths)} image(s) for organelles: {args.organelles}")
+
+        for path in image_paths:
+            print(f"\n--- {path.name} ---")
+            masks = segment(pipe, path, args.organelles, args.output_dir, **kwargs)
+            for m in masks:
+                print(f"  Saved: {m}")
+
+        print("\nDone.")
 
 
 def cmd_refine(args: argparse.Namespace) -> None:
+    # Merge YAML config if provided
+    if args.config:
+        config = _load_yaml_config(args.config)
+        args = _merge_config_with_args(args, config)
+
+    # Validate required args
+    if not args.input and not getattr(args, "zarr_path", None):
+        raise SystemExit("Error: one of --input or --zarr-path is required (or set in --config)")
+    if not args.organelle:
+        raise SystemExit("Error: --organelle is required (or set in --config)")
+
+    # Default output_dir after config merge
+    if not args.output_dir:
+        args.output_dir = Path("outputs")
+    args.output_dir = Path(args.output_dir) if isinstance(args.output_dir, str) else args.output_dir
+
     from .agents import (
         GenerationParams,
         LoopConfig,
@@ -340,6 +546,16 @@ def cmd_refine(args: argparse.Namespace) -> None:
         llm_kwargs["gcp_location"] = args.gcp_location
 
     llm_backend = create_llm_backend(args.llm_provider, **llm_kwargs)
+
+    # Build point detection backend (separate VLM for Molmo-style pointing)
+    point_backend = None
+    if getattr(args, "point_provider", None):
+        point_kwargs = {}
+        if args.point_model:
+            point_kwargs["model"] = args.point_model
+        if args.point_provider == "ollama":
+            point_kwargs["host"] = args.ollama_host
+        point_backend = create_llm_backend(args.point_provider, **point_kwargs)
 
     # Build gen backend
     if args.gen_backend == "sam3":
@@ -380,7 +596,38 @@ def cmd_refine(args: argparse.Namespace) -> None:
             vertex_ai=args.vertex_ai,
         )
 
-    em_image = load_em_image(args.input)
+    # Load EM image(s)
+    zarr_path = getattr(args, "zarr_path", None)
+    z_count = getattr(args, "z_count", 1)
+    roi_str = getattr(args, "roi", None)
+
+    if zarr_path:
+        from .zarr_io import get_zarr_info, load_zarr_slice, load_zarr_zstack, parse_roi
+
+        roi = parse_roi(roi_str) if roi_str else None
+        info = get_zarr_info(zarr_path, args.dataset_path)
+        print(f"Zarr volume: {zarr_path} {info}")
+        if roi:
+            print(f"  ROI (nm): {roi}")
+
+        use_zarr_zstack = roi is not None or z_count > 1
+
+        if use_zarr_zstack:
+            em_slices = load_zarr_zstack(
+                zarr_path, args.dataset_path,
+                roi=roi, z_step_nm=getattr(args, "z_step_nm", None),
+                z_start=args.z_start, z_count=z_count, z_step=args.z_step,
+            )
+            em_image = em_slices[0]
+            print(f"Loaded {len(em_slices)} slices")
+        else:
+            em_image = load_zarr_slice(zarr_path, args.dataset_path, z_index=args.z_start)
+            em_slices = None
+    else:
+        use_zarr_zstack = False
+        em_image = load_em_image(args.input)
+        em_slices = None
+
     instance = getattr(args, "instance", False)
     mask_mode = getattr(args, "mask_mode", "overlay")
     resolution_nm = getattr(args, "resolution", None)
@@ -451,8 +698,9 @@ def cmd_refine(args: argparse.Namespace) -> None:
 
     initial_params = GenerationParams(**param_kwargs)
 
+    max_iter = 1 if getattr(args, "skip_refinement", False) else args.max_iterations
     config = LoopConfig(
-        max_iterations=args.max_iterations,
+        max_iterations=max_iter,
         min_acceptable_score=args.min_score,
         save_intermediates=args.save_intermediates,
     )
@@ -467,56 +715,108 @@ def cmd_refine(args: argparse.Namespace) -> None:
     else:
         gen_model_name = getattr(gen_backend, "model", args.gen_backend)
     eval_model_name = getattr(llm_backend, "model", args.llm_provider)
+    point_model_name = args.point_model.split("/")[-1] if getattr(args, "point_model", None) else None
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dir_parts = [gen_model_name]
+    if point_model_name:
+        dir_parts.append(point_model_name)
+    dir_parts.append(eval_model_name)
     run_dir = (
         args.output_dir
-        / f"{gen_model_name}_{eval_model_name}"
+        / "_".join(dir_parts)
         / args.organelle
         / timestamp
     )
 
-    print(f"Refining {organelle.name} segmentation on {args.input.name}")
+    if zarr_path:
+        input_desc = f"{zarr_path} z={args.z_start}" + (f"..{args.z_start + z_count * args.z_step}" if use_zarr_zstack else "")
+    else:
+        input_desc = args.input.name
+    print(f"Refining {organelle.name} segmentation on {input_desc}")
     if args.gen_backend == "flux":
         print(f"  Gen backend: flux ({args.model})")
     else:
         print(f"  Gen backend: {args.gen_backend} ({gen_model_name})")
     print(f"  Evaluator: {args.llm_provider} ({eval_model_name})")
+    if point_backend:
+        print(f"  Point detection: {args.point_provider} ({args.point_model})")
     print(f"  Max iterations: {args.max_iterations}, min score: {args.min_score}")
     print(f"  Output: {run_dir}")
 
-    result = run_refinement_loop(
-        gen_backend=gen_backend,
-        llm_backend=llm_backend,
-        em_image=em_image,
-        organelle=organelle,
-        initial_params=initial_params,
-        config=config,
-        output_dir=run_dir,
-        instance=instance,
-        mask_mode=mask_mode,
-        gen_model=gen_model_name,
-        resolution_nm=resolution_nm,
-        llm_model=getattr(args, "llm_model", "") or "",
-    )
+    if use_zarr_zstack:
+        from .agents.zstack import run_zstack_refinement
 
-    if result.converged:
-        status = "converged"
-    elif result.plateau:
-        status = "score plateau"
-    else:
-        status = "max iterations reached"
-    print(f"\n=== Done ({status}) ===")
-    print(f"  Best score: {result.best_evaluation.score:.3f}")
-    if result.best_evaluation.detailed_scores:
-        ds = result.best_evaluation.detailed_scores
-        print(
-            f"  Details: tp_rate={ds.tp_rate:.2f}  fp_rate={ds.fp_rate:.2f}  "
-            f"fn_rate={ds.fn_rate:.2f}  boundary={ds.boundary_quality:.2f}  "
-            f"dice={ds.dice_score:.3f}"
+        zstack_result = run_zstack_refinement(
+            gen_backend=gen_backend,
+            llm_backend=llm_backend,
+            slices=em_slices,
+            organelle=organelle,
+            initial_params=initial_params,
+            config=config,
+            output_dir=run_dir,
+            instance=instance,
+            mask_mode=mask_mode,
+            gen_model=gen_model_name,
+            resolution_nm=resolution_nm,
+            llm_model=getattr(args, "llm_model", "") or "",
+            use_video_predictor=getattr(args, "use_video_predictor", False),
+            multi_slice_points=getattr(args, "multi_slice_points", False),
+            point_sample=getattr(args, "point_sample", None),
+            point_backend=point_backend,
+            point_model=getattr(args, "point_model", "") or "",
+            point_prompt=getattr(args, "point_prompt", None),
+            z_start=args.z_start,
         )
-    print(f"  Total iterations: {result.total_iterations}")
-    if args.save_intermediates:
-        print(f"  Results saved to: {args.output_dir}")
+
+        print(f"\n=== Z-Stack Done ===")
+        print(f"  Slices processed: {zstack_result.total_slices}")
+        for i, score in enumerate(zstack_result.per_slice_scores):
+            print(f"  Slice {i}: score={score:.3f}")
+
+        # Save zarr output if requested
+        save_zarr_path = getattr(args, "save_zarr", None)
+        if save_zarr_path:
+            from .zarr_io import save_masks_to_zarr
+            save_masks_to_zarr(zstack_result.masks, save_zarr_path)
+    else:
+        result = run_refinement_loop(
+            gen_backend=gen_backend,
+            llm_backend=llm_backend,
+            em_image=em_image,
+            organelle=organelle,
+            initial_params=initial_params,
+            config=config,
+            output_dir=run_dir,
+            instance=instance,
+            mask_mode=mask_mode,
+            gen_model=gen_model_name,
+            resolution_nm=resolution_nm,
+            llm_model=getattr(args, "llm_model", "") or "",
+        )
+
+        if result.converged:
+            status = "converged"
+        elif result.plateau:
+            status = "score plateau"
+        else:
+            status = "max iterations reached"
+        print(f"\n=== Done ({status}) ===")
+        print(f"  Best score: {result.best_evaluation.score:.3f}")
+        if result.best_evaluation.detailed_scores:
+            ds = result.best_evaluation.detailed_scores
+            print(
+                f"  Details: tp_rate={ds.tp_rate:.2f}  fp_rate={ds.fp_rate:.2f}  "
+                f"fn_rate={ds.fn_rate:.2f}  boundary={ds.boundary_quality:.2f}  "
+                f"dice={ds.dice_score:.3f}"
+            )
+        print(f"  Total iterations: {result.total_iterations}")
+        if args.save_intermediates:
+            print(f"  Results saved to: {args.output_dir}")
+
+        # Save zarr output for single-slice zarr input
+        save_zarr_path = getattr(args, "save_zarr", None)
+        if save_zarr_path and zarr_path:
+            print(f"  Note: --save-zarr requires z-count > 1 for 3D output.")
 
 
 
