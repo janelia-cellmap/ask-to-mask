@@ -11,6 +11,10 @@ Requires [pixi](https://pixi.sh).
 ```bash
 pixi install
 pixi run install-torch-cu126
+
+# For Molmo2 point detection (separate env with transformers <5)
+pixi install -e molmo
+pixi run -e molmo install-torch-cu126
 ```
 
 ## Usage
@@ -75,17 +79,21 @@ Uses `funlib.geometry.Roi` under the hood — ROI is snapped to the voxel grid a
 | `--z-count` | `1` | Number of Z slices to process |
 | `--z-step` | `1` | Step between Z slices |
 | `--roi` | None | ROI in world coords (nm), e.g. `[500:1000,500:1000,1000:11000]`. Overrides z-start/z-count/z-step |
+| `--z-step-nm` | None | Z spacing in nm when using `--roi` (e.g. `40` reads every 40 nm). Default: every voxel |
 | `--save-zarr` | None | Path to save 3D mask stack as zarr |
 
 ### YAML config files
 
-All CLI flags can be set in a YAML config file. CLI flags override config values.
+All CLI flags can be set in a YAML config file. CLI flags override config values. Both `segment` and `refine` subcommands support `--config`.
 
 ```bash
 pixi run segment refine --config configs/refine_zarr_example.yaml
 
 # Override a config value from CLI
 pixi run segment refine --config configs/refine_zarr_example.yaml --organelle er
+
+# Also works with segment
+pixi run segment segment --config configs/my_segment_config.yaml
 ```
 
 See [configs/refine_zarr_example.yaml](configs/refine_zarr_example.yaml) for a full example.
@@ -305,6 +313,10 @@ pixi run segment refine --zarr-path /path/to/volume.zarr/recon-1/em/fibsem-uint8
 | `--use-video-predictor` | off | Use SAM3 video predictor for cross-slice mask propagation |
 | `--multi-slice-points` | off | Run Molmo independently on each slice to find points |
 | `--point-sample` | all | Number of slices to sample for Molmo point detection |
+| `--point-provider` | same as `--llm-provider` | VLM provider for point detection (e.g. `huggingface` for Molmo) |
+| `--point-model` | None | VLM model for point detection (e.g. `allenai/Molmo2-8B`) |
+| `--point-prompt` | `"Point to the {organelle}"` | Custom prompt for Molmo point detection |
+| `--skip-refinement` | off | Skip iterative evaluation/refinement loop — just detect points and run SAM3 once |
 
 When `--multi-slice-points` is combined with `--use-video-predictor`, Molmo runs on each slice independently to find organelle locations, then those per-slice points are fed as frame-specific prompts to the SAM3 video predictor. The video predictor propagates masks forward and backward, handling cross-slice consistency and filling in slices where Molmo found nothing.
 
@@ -391,7 +403,7 @@ src/ask_to_mask/
     gen_backend.py      # Pluggable image generation backends (Flux, Gemini, GLM, Qwen)
     sam3_backend.py     # SAM3 segmentation backend (text, VLM-coordinate, painted-marker, video predictor)
     marker_detection.py # Colored marker detection for SAM3 painted-marker strategy
-    llm_backend.py      # Pluggable LLM/VLM backends (ollama, Anthropic, Google, OpenAI)
+    llm_backend.py      # Pluggable LLM/VLM backends (ollama, Anthropic, Google, OpenAI, HuggingFace)
     evaluator.py        # Combined critic+refiner agent (with SAM3 point refinement + per-slice Molmo)
     loop.py             # Generate-evaluate-refine orchestrator
     zstack.py           # Z-stack orchestrator: multi-slice refinement with video predictor
@@ -401,8 +413,10 @@ src/ask_to_mask/
     zarr_utils.py  # Zarr reading utilities (adapted from sam3m)
     train.py       # LoRA training loop with accelerate + PEFT
 scripts/
+  molmo_points.py       # Standalone Molmo2 inference script (runs in molmo pixi env)
   preview_crop_norms.py # Preview and auto-compute intensity normalization per dataset
 configs/
+  refine_zarr_example.yaml                     # Example config for z-stack zarr refinement
   train_lora.yaml                  # Kontext training configuration
   train_lora_flux2.yaml            # Flux2-dev training configuration
   train_lora_flux2_r64_autonorm.yaml           # Flux2-dev with auto-norms, rank 64
