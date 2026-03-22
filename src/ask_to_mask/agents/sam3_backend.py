@@ -62,6 +62,7 @@ class SAM3Backend(ImageGenBackend):
         self._model = None
         self._processor = None
         self._point_predictor = None
+        self._video_predictor = None
         self._model_name = model_name
 
     def _load_model(self):
@@ -330,6 +331,150 @@ class SAM3Backend(ImageGenBackend):
             union = np.maximum(union, (masks[idx] > 0).astype(np.uint8) * 255)
 
         return union
+
+    # ---------------------------------------------------------------
+    # Video predictor for z-stack propagation
+    # ---------------------------------------------------------------
+
+    def _load_video_model(self):
+        """Load SAM3 video predictor on first use (separate from image model)."""
+        if self._video_predictor is not None:
+            return
+
+        from sam3.model_builder import build_sam3_video_model
+
+        print(f"  Loading SAM3 video model: {self._model_name}")
+        kwargs = {"device": self.device}
+        if self._model_name != "facebook/sam3":
+            kwargs["checkpoint_path"] = self._model_name
+            kwargs["load_from_HF"] = False
+        self._video_predictor = build_sam3_video_model(**kwargs)
+
+    def generate_zstack(
+        self,
+        slices: list[Image.Image],
+        params: GenerationParams,
+        prompt_frames: dict[int, dict],
+        instance: bool = False,
+    ) -> list[np.ndarray]:
+        """Run SAM3 video predictor across a z-stack.
+
+        SAM3's video predictor requires a two-phase approach:
+        1. **Detection phase** — add text prompts and propagate to build the
+           tracking cache and get initial masks.
+        2. **Refinement phase** (optional) — add point prompts (from Molmo) to
+           refine tracked objects, then propagate again.
+
+        Point prompts use the "tracker" path (``add_tracker_new_points``) which
+        requires cached outputs from a prior propagation, so they cannot be used
+        as initial conditioning.
+
+        Args:
+            slices: List of RGB PIL Images (one per z-slice).
+            params: Generation parameters.
+            prompt_frames: Dict mapping frame_idx to prompt info.
+                Each value is either ``{"text": str}`` or
+                ``{"points": [[x, y], ...], "point_labels": [1, 0, ...]}``.
+            instance: If True, return instance-labeled masks.
+
+        Returns:
+            List of numpy masks (one per slice), uint8 binary or uint16 labeled.
+        """
+        self._load_video_model()
+        predictor = self._video_predictor
+
+        # Initialize tracking state with the z-stack frames as PIL images
+        inference_state = predictor.init_state(
+            resource_path=[self._to_rgb(s) for s in slices]
+        )
+
+        # Separate text prompts from point prompts
+        text_frames = {k: v for k, v in prompt_frames.items() if "text" in v}
+        point_frames = {k: v for k, v in prompt_frames.items() if "points" in v}
+
+        # --- Phase 1: Text-based detection ---
+        # If we have point prompts but no text prompts, add a text prompt on the
+        # middle frame so we have an initial detection to build the cache.
+        if point_frames and not text_frames:
+            mid = len(slices) // 2
+            organelle_name = params.extra.get("organelle_name", params.prompt)
+            text_frames[mid] = {"text": organelle_name}
+            print(f"  Adding text prompt on middle frame {mid} for initial detection")
+
+        for frame_idx, prompt_info in text_frames.items():
+            predictor.add_prompt(
+                inference_state,
+                frame_idx,
+                text_str=prompt_info["text"],
+            )
+            print(f"  Frame {frame_idx}: text prompt '{prompt_info['text']}'")
+
+        # Propagate forward and backward to build cache + initial masks
+        results = self._propagate_bidirectional(predictor, inference_state)
+        print(f"  Phase 1 (text detection): masks on {len(results)}/{len(slices)} frames")
+
+        # --- Phase 2: Point-based refinement (if Molmo points available) ---
+        if point_frames:
+            # Find which obj_id(s) were detected in phase 1
+            # Use obj_id=1 as default (first tracked object)
+            obj_id = 1
+            for frame_idx, prompt_info in sorted(point_frames.items()):
+                # Look up detected obj_ids from phase 1 to pick the right one
+                if frame_idx in results and results[frame_idx]["out_obj_ids"].size > 0:
+                    obj_id = int(results[frame_idx]["out_obj_ids"][0])
+                predictor.add_prompt(
+                    inference_state,
+                    frame_idx,
+                    points=prompt_info["points"],
+                    point_labels=prompt_info["point_labels"],
+                    obj_id=obj_id,
+                )
+                print(f"  Frame {frame_idx}: {len(prompt_info['points'])} refinement point(s) (obj_id={obj_id})")
+
+            # Re-propagate to spread refinements
+            results = self._propagate_bidirectional(predictor, inference_state)
+            print(f"  Phase 2 (point refinement): masks on {len(results)}/{len(slices)} frames")
+
+        # Collect per-frame masks
+        h, w = np.array(slices[0]).shape[:2]
+        per_frame_masks = []
+        for i in range(len(slices)):
+            if i in results:
+                out = results[i]
+                mask_np = out["out_binary_masks"]  # (num_objects, H, W) bool
+
+                if instance:
+                    labeled = np.zeros((h, w), dtype=np.uint16)
+                    for obj_i in range(mask_np.shape[0]):
+                        labeled[mask_np[obj_i]] = obj_i + 1
+                    per_frame_masks.append(labeled)
+                else:
+                    union = np.any(mask_np, axis=0).astype(np.uint8) * 255
+                    per_frame_masks.append(union)
+            else:
+                if instance:
+                    per_frame_masks.append(np.zeros((h, w), dtype=np.uint16))
+                else:
+                    per_frame_masks.append(np.zeros((h, w), dtype=np.uint8))
+
+        print(f"  Video predictor: produced masks for {len(results)}/{len(slices)} frames")
+        return per_frame_masks
+
+    @staticmethod
+    def _propagate_bidirectional(predictor, inference_state) -> dict[int, dict]:
+        """Run propagation forward and backward, merging results."""
+        results: dict[int, dict] = {}
+        for frame_idx, output in predictor.propagate_in_video(
+            inference_state, reverse=False
+        ):
+            if output is not None:
+                results[frame_idx] = output
+        for frame_idx, output in predictor.propagate_in_video(
+            inference_state, reverse=True
+        ):
+            if output is not None and frame_idx not in results:
+                results[frame_idx] = output
+        return results
 
     # Distinct colors for per-instance visualization
     INSTANCE_COLORS = [
