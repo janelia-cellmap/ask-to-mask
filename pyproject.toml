@@ -17,14 +17,16 @@ dependencies = [
     "numpy",
     "scikit-image",
     "tqdm",
+    "zarr",
+    "funlib.geometry",
+    "funlib.persistence",
+    "pyyaml",
 ]
 
 [project.optional-dependencies]
 train = [
     "peft>=0.7.0",
-    "zarr",
     "scipy",
-    "pyyaml",
     "tensorboard",
     "bitsandbytes",
 ]
