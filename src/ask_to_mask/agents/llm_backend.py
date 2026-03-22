@@ -346,14 +346,15 @@ class HuggingFaceBackend(LLMBackend):
                 auto_cls = getattr(transformers, auto_cls_name)
                 self._model = auto_cls.from_pretrained(self.model_name, **model_kwargs)
                 print(f"Model loaded via {auto_cls_name} on {self.device}.")
-                return
+                break
             except Exception as e:
                 errors.append(f"{auto_cls_name}: {type(e).__name__}: {e}")
                 continue
-        raise RuntimeError(
-            f"Could not load {self.model_name} with any AutoModel class:\n"
-            + "\n".join(errors)
-        )
+        else:
+            raise RuntimeError(
+                f"Could not load {self.model_name} with any AutoModel class:\n"
+                + "\n".join(errors)
+            )
 
     def chat_with_images(
         self, system_prompt: str, user_prompt: str, images: list[Image.Image]
