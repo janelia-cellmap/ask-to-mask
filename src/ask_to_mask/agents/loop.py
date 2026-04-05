@@ -96,6 +96,9 @@ def run_refinement_loop(
     gen_model: str = "",
     resolution_nm: float | None = None,
     llm_model: str = "",
+    point_backend: LLMBackend | None = None,
+    point_model: str = "",
+    validate_points: bool = False,
 ) -> LoopResult:
     """Run the generate-evaluate-refine loop.
 
@@ -109,6 +112,8 @@ def run_refinement_loop(
         gen_model=gen_model,
         resolution_nm=resolution_nm,
         llm_model=llm_model,
+        point_backend=point_backend,
+        point_model=point_model,
     )
 
     # Check if this is a SAM3 point-based strategy
@@ -124,6 +129,14 @@ def run_refinement_loop(
         print(f"  Initial points: {len(points)} locations")
         for p in points:
             print(f"    ({p['x']}, {p['y']}) label={p.get('label', 1)}")
+        # Optionally validate each point via the eval VLM
+        if validate_points and points:
+            print("\n=== Validating points via eval VLM ===")
+            points = evaluator.validate_points(em_image, points, organelle)
+            if not points:
+                print("  Warning: all points were rejected, using image center as fallback")
+                w, h = em_image.size
+                points = [{"x": w // 2, "y": h // 2, "label": 1, "instance": 0}]
         initial_params = _with_extra(
             initial_params, {**initial_params.extra, "points": points}
         )

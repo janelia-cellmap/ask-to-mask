@@ -157,7 +157,21 @@ Respond with ONLY JSON:
 """
 
 
-MOLMO_POINTS_PROMPT = "Point to the {organelle}"
+MOLMO_POINTS_PROMPT = "Point to the center of each {organelle} in this electron microscopy image. {description}Point to each separate instance individually."
+
+POINT_VALIDATION_PROMPT = """\
+You are validating whether a marked location in an electron microscopy (EM) image \
+correctly identifies a specific organelle. A red circle with crosshair marks the \
+location being evaluated.
+
+Look at the marked location and determine if it is on or very close to the target \
+organelle. Consider the surrounding context and morphology.
+
+Respond with ONLY JSON:
+{"valid": true, "reasoning": "brief reason"}
+or
+{"valid": false, "reasoning": "brief reason"}\
+"""
 
 
 class EvaluatorAgent:
@@ -171,13 +185,18 @@ class EvaluatorAgent:
         resolution_nm: float | None = None,
         llm_model: str = "",
         point_prompt: str | None = None,
+        point_backend: LLMBackend | None = None,
+        point_model: str = "",
     ):
         self.backend = backend
         self.instance = instance
         self.gen_model = gen_model
         self.resolution_nm = resolution_nm
-        self.is_molmo = "molmo" in llm_model.lower()
         self.point_prompt = point_prompt
+        # Dedicated point detection backend/model (falls back to eval backend)
+        self.point_backend = point_backend or backend
+        self.point_model = point_model or llm_model
+        self.is_molmo = "molmo" in self.point_model.lower()
         # Stores VLM prompts used for the most recent initial generation call
         self.last_init_vlm_prompts: dict | None = None
 
@@ -274,7 +293,7 @@ class EvaluatorAgent:
         parts.append("\nIdentify each visible instance and provide center coordinates. Respond with JSON only.")
         user_prompt = "\n".join(parts)
 
-        raw = self.backend.chat_with_image(VLM_INITIAL_POINTS_PROMPT, user_prompt, em_image)
+        raw = self.point_backend.chat_with_image(VLM_INITIAL_POINTS_PROMPT, user_prompt, em_image)
         self.last_init_vlm_prompts = {
             "system": VLM_INITIAL_POINTS_PROMPT,
             "user": user_prompt,
@@ -412,7 +431,10 @@ class EvaluatorAgent:
         import tempfile
         from pathlib import Path
 
-        prompt = self.point_prompt or MOLMO_POINTS_PROMPT.format(organelle=organelle.name)
+        description = f"{organelle.description} " if organelle.description else ""
+        prompt = self.point_prompt or MOLMO_POINTS_PROMPT.format(
+            organelle=organelle.name, description=description
+        )
 
         self.last_init_vlm_prompts = {
             "system": "",
@@ -544,6 +566,90 @@ class EvaluatorAgent:
     def _assign_instance_ids(points: list[dict]) -> list[dict]:
         """Assign each point its own unique instance ID."""
         return [{**p, "instance": i} for i, p in enumerate(points)]
+
+    def validate_points(
+        self,
+        em_image: Image.Image,
+        points: list[dict],
+        organelle: OrganelleClass,
+    ) -> list[dict]:
+        """Validate each point by marking it on the full image and asking the eval VLM.
+
+        For each point, draws a red circle + crosshair on a copy of the EM image
+        and asks the eval VLM whether the marked location is on the target organelle.
+        Returns only the points that the VLM confirms as valid.
+        """
+        import json
+        from PIL import ImageDraw
+
+        if not points:
+            return points
+
+        validated = []
+        marker_radius = max(8, min(em_image.size) // 40)
+
+        for i, pt in enumerate(points):
+            x, y = pt["x"], pt["y"]
+            label = pt.get("label", 1)
+
+            # Skip background points — only validate foreground
+            if label == 0:
+                validated.append(pt)
+                continue
+
+            # Draw marker on a copy of the EM image
+            marked = em_image.copy().convert("RGB")
+            draw = ImageDraw.Draw(marked)
+            r = marker_radius
+            # Red circle
+            draw.ellipse([x - r, y - r, x + r, y + r], outline="red", width=3)
+            # Crosshair
+            draw.line([x - r, y, x + r, y], fill="red", width=2)
+            draw.line([x, y - r, x, y + r], fill="red", width=2)
+
+            # Build user prompt
+            parts = [
+                f"The red marker is at pixel ({x}, {y}) in this {em_image.size[0]}x{em_image.size[1]} EM image.",
+                f"Target organelle: {organelle.name}.",
+            ]
+            if organelle.description:
+                parts.append(f"In EM, {organelle.name} appear as: {organelle.description}")
+            if self.resolution_nm is not None:
+                parts.append(f"Image resolution: {self.resolution_nm:.0f} nm/px.")
+            parts.append("Is the red marker correctly placed on this organelle? Respond with JSON only.")
+            user_prompt = "\n".join(parts)
+
+            try:
+                raw = self.backend.chat_with_image(
+                    POINT_VALIDATION_PROMPT, user_prompt, marked
+                )
+                # Parse response
+                json_str = raw.strip()
+                # Handle markdown code blocks
+                if "```" in json_str:
+                    json_str = json_str.split("```")[1]
+                    if json_str.startswith("json"):
+                        json_str = json_str[4:]
+                    json_str = json_str.strip()
+                result = json.loads(json_str)
+                is_valid = result.get("valid", True)
+                reasoning = result.get("reasoning", "")
+            except Exception as e:
+                # If parsing fails, keep the point (conservative)
+                print(f"  Point [{i}] ({x}, {y}): validation parse error ({e}), keeping")
+                validated.append(pt)
+                continue
+
+            status = "VALID" if is_valid else "REJECTED"
+            print(f"  Point [{i}] ({x}, {y}): {status} — {reasoning}")
+
+            if is_valid:
+                validated.append(pt)
+
+        accepted = sum(1 for p in validated if p.get("label", 1) == 1)
+        total_fg = sum(1 for p in points if p.get("label", 1) == 1)
+        print(f"  Point validation: {accepted}/{total_fg} foreground points accepted")
+        return validated
 
     def evaluate_and_refine_with_points(
         self,

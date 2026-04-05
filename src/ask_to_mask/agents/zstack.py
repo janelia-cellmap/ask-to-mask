@@ -48,6 +48,7 @@ def run_zstack_refinement(
     point_model: str = "",
     point_prompt: str | None = None,
     z_start: int = 0,
+    validate_points: bool = False,
 ) -> ZStackResult:
     """Run refinement across a z-stack of slices.
 
@@ -98,6 +99,9 @@ def run_zstack_refinement(
         llm_model=llm_model,
         per_slice_points=per_slice_points,
         z_start=z_start,
+        point_backend=point_backend,
+        point_model=point_model,
+        validate_points=validate_points,
     )
 
 
@@ -116,6 +120,9 @@ def _run_per_slice(
     llm_model: str,
     per_slice_points: dict[int, list[dict]] | None,
     z_start: int,
+    point_backend: LLMBackend | None = None,
+    point_model: str = "",
+    validate_points: bool = False,
 ) -> ZStackResult:
     """Mode A/C: Process each slice independently via run_refinement_loop."""
     all_masks = []
@@ -146,6 +153,9 @@ def _run_per_slice(
             gen_model=gen_model,
             resolution_nm=resolution_nm,
             llm_model=llm_model,
+            point_backend=point_backend,
+            point_model=point_model,
+            validate_points=validate_points,
         )
 
         all_masks.append(result.best_result.mask)

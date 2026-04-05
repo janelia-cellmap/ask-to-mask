@@ -308,6 +308,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ref.add_argument("--point-model", default=None, help="VLM model for point detection (e.g. allenai/Molmo2-8B).")
     ref.add_argument("--point-prompt", default=None, help="Custom prompt for Molmo point detection (default: 'Point to the {organelle}').")
     ref.add_argument(
+        "--validate-points",
+        action="store_true",
+        help="Validate each detected point by asking the eval VLM to confirm it's on the target organelle.",
+    )
+    ref.add_argument(
         "--skip-refinement",
         action="store_true",
         help="Skip the iterative evaluation/refinement loop. Just detect points and run SAM3 once.",
@@ -766,6 +771,7 @@ def cmd_refine(args: argparse.Namespace) -> None:
             point_model=getattr(args, "point_model", "") or "",
             point_prompt=getattr(args, "point_prompt", None),
             z_start=args.z_start,
+            validate_points=getattr(args, "validate_points", False),
         )
 
         print(f"\n=== Z-Stack Done ===")
@@ -792,6 +798,9 @@ def cmd_refine(args: argparse.Namespace) -> None:
             gen_model=gen_model_name,
             resolution_nm=resolution_nm,
             llm_model=getattr(args, "llm_model", "") or "",
+            point_backend=point_backend,
+            point_model=getattr(args, "point_model", "") or "",
+            validate_points=getattr(args, "validate_points", False),
         )
 
         if result.converged:
