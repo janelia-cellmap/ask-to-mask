@@ -227,7 +227,38 @@ def run_refinement_loop(
         if config.save_intermediates and output_dir:
             _save_iteration(output_dir, iteration, result, em_image)
 
-        # Step 2: Evaluate
+        # Step 2: Evaluate (skip if single iteration — no refinement needed)
+        if config.max_iterations == 1:
+            # No evaluation needed — just save generation info and return
+            dummy_eval = EvaluationResult(
+                score=0.0,
+                detailed_scores=None,
+                issues=[],
+                refined_prompt=None,
+                param_adjustments={},
+                should_stop=True,
+                reasoning="skipped (single iteration)",
+                raw_response="",
+            )
+            all_evaluations.append(dummy_eval)
+            if config.save_intermediates and output_dir:
+                _save_evaluation(
+                    output_dir,
+                    iteration,
+                    dummy_eval,
+                    current_params,
+                    init_vlm_prompts=evaluator.last_init_vlm_prompts if iteration == 0 else None,
+                )
+            print("  Evaluation skipped (single iteration)")
+            return LoopResult(
+                best_result=result,
+                best_evaluation=dummy_eval,
+                all_results=all_results,
+                all_evaluations=all_evaluations,
+                total_iterations=1,
+                converged=False,
+            )
+
         if use_points:
             evaluation = evaluator.evaluate_and_refine_with_points(
                 em_image, result, organelle, history

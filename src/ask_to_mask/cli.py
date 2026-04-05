@@ -525,7 +525,7 @@ def cmd_refine(args: argparse.Namespace) -> None:
 
     # Default output_dir after config merge
     if not args.output_dir:
-        args.output_dir = Path("outputs")
+        args.output_dir = Path("outputs/refined")
     args.output_dir = Path(args.output_dir) if isinstance(args.output_dir, str) else args.output_dir
 
     from .agents import (

@@ -18,8 +18,8 @@ roi: "[4000:4080, 4000:8000, 4000:8000]"
 # z_step: 1
 
 # Output
-output_dir: ./refined/
-save_zarr: ./refined/masks.zarr
+output_dir: ./outputs/refined/
+save_zarr: ./outputs/refined/masks.zarr
 
 # Organelle
 organelle: mito
