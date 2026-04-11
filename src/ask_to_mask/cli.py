@@ -242,6 +242,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Enable SAM3 video predictor for z-stack mask propagation (only with --gen-backend sam3).",
     )
     ref.add_argument(
+        "--ortho",
+        action="store_true",
+        help="Process all 3 orthogonal planes (XY, XZ, YZ) and merge via majority vote.",
+    )
+    ref.add_argument(
+        "--parallel-points",
+        action="store_true",
+        help="Run Molmo point detection for all ortho planes in parallel (~60 GB VRAM needed).",
+    )
+    ref.add_argument(
         "--multi-slice-points",
         action="store_true",
         help="Run Molmo on each slice independently to find points.",
@@ -511,6 +521,31 @@ def cmd_segment(args: argparse.Namespace) -> None:
         print("\nDone.")
 
 
+def _save_run_metadata(args: argparse.Namespace, run_dir: Path) -> None:
+    """Save the config file and CLI command to the output directory."""
+    import json
+    import shutil
+
+    # Copy the config YAML if one was used
+    config_path = getattr(args, "config", None)
+    if config_path:
+        config_path = Path(config_path)
+        if config_path.is_file():
+            shutil.copy2(config_path, run_dir / "config.yaml")
+
+    # Save the full resolved args as JSON (all CLI + config values merged)
+    args_dict = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
+    # Remove non-serializable entries
+    args_dict.pop("func", None)
+    with open(run_dir / "args.json", "w") as f:
+        json.dump(args_dict, f, indent=2, default=str)
+
+    # Save the original command line
+    import sys
+    with open(run_dir / "command.txt", "w") as f:
+        f.write(" ".join(sys.argv) + "\n")
+
+
 def cmd_refine(args: argparse.Namespace) -> None:
     # Merge YAML config if provided
     if args.config:
@@ -539,18 +574,25 @@ def cmd_refine(args: argparse.Namespace) -> None:
 
     organelle = ORGANELLES[args.organelle]
 
-    # Build LLM backend kwargs
-    llm_kwargs = {}
-    if args.llm_model:
-        llm_kwargs["model"] = args.llm_model
-    if args.llm_provider == "ollama":
-        llm_kwargs["host"] = args.ollama_host
-    if args.vertex_ai:
-        llm_kwargs["vertex_ai"] = True
-        llm_kwargs["gcp_project"] = args.gcp_project
-        llm_kwargs["gcp_location"] = args.gcp_location
+    # Build LLM backend (eval VLM) — skip if not needed
+    skip_refinement = getattr(args, "skip_refinement", False)
+    has_point_provider = getattr(args, "point_provider", None) is not None
+    sam3_strategy = getattr(args, "sam3_strategy", "text")
+    need_eval_llm = not skip_refinement or (not has_point_provider) or sam3_strategy == "painted-marker"
 
-    llm_backend = create_llm_backend(args.llm_provider, **llm_kwargs)
+    if need_eval_llm:
+        llm_kwargs = {}
+        if args.llm_model:
+            llm_kwargs["model"] = args.llm_model
+        if args.llm_provider == "ollama":
+            llm_kwargs["host"] = args.ollama_host
+        if args.vertex_ai:
+            llm_kwargs["vertex_ai"] = True
+            llm_kwargs["gcp_project"] = args.gcp_project
+            llm_kwargs["gcp_location"] = args.gcp_location
+        llm_backend = create_llm_backend(args.llm_provider, **llm_kwargs)
+    else:
+        llm_backend = None
 
     # Build point detection backend (separate VLM for Molmo-style pointing)
     point_backend = None
@@ -572,7 +614,7 @@ def cmd_refine(args: argparse.Namespace) -> None:
             "confidence_threshold": args.sam3_confidence,
         }
         if args.sam3_strategy == "vlm-coordinate":
-            sam3_kwargs["llm_backend"] = llm_backend
+            sam3_kwargs["llm_backend"] = llm_backend or point_backend
         if args.sam3_strategy == "painted-marker":
             if not args.marker_backend:
                 raise SystemExit(
@@ -606,18 +648,38 @@ def cmd_refine(args: argparse.Namespace) -> None:
     z_count = getattr(args, "z_count", 1)
     roi_str = getattr(args, "roi", None)
 
+    use_ortho = getattr(args, "ortho", False)
+    ortho_slices = None
+    volume_shape = None
+    zarr_voxel_size = None
+    zarr_offset = None
+
     if zarr_path:
         from .zarr_io import get_zarr_info, load_zarr_slice, load_zarr_zstack, parse_roi
 
         roi = parse_roi(roi_str) if roi_str else None
         info = get_zarr_info(zarr_path, args.dataset_path)
         print(f"Zarr volume: {zarr_path} {info}")
+        zarr_voxel_size = info.get("voxel_size")
         if roi:
             print(f"  ROI (nm): {roi}")
+            zarr_offset = tuple(roi.offset)
 
         use_zarr_zstack = roi is not None or z_count > 1
 
-        if use_zarr_zstack:
+        if use_ortho and roi is not None:
+            from .zarr_io import load_zarr_ortho_slices
+            ortho_slices = load_zarr_ortho_slices(
+                zarr_path, args.dataset_path,
+                roi=roi, z_step_nm=getattr(args, "z_step_nm", None),
+            )
+            # Also load XY slices for the standard path (used for em_image)
+            xy_slices, data_3d, _xy_indices = ortho_slices["xy"]
+            em_slices = xy_slices
+            em_image = em_slices[0] if em_slices else None
+            volume_shape = data_3d.shape
+            print(f"Loaded orthogonal slices, volume shape: {volume_shape}")
+        elif use_zarr_zstack:
             em_slices = load_zarr_zstack(
                 zarr_path, args.dataset_path,
                 roi=roi, z_step_nm=getattr(args, "z_step_nm", None),
@@ -748,7 +810,46 @@ def cmd_refine(args: argparse.Namespace) -> None:
     print(f"  Max iterations: {args.max_iterations}, min score: {args.min_score}")
     print(f"  Output: {run_dir}")
 
-    if use_zarr_zstack:
+    # Save the config and command used to the output directory for reproducibility
+    run_dir.mkdir(parents=True, exist_ok=True)
+    _save_run_metadata(args, run_dir)
+
+    if use_ortho and ortho_slices is not None:
+        from .agents.zstack import run_ortho_zstack_refinement
+
+        zstack_result = run_ortho_zstack_refinement(
+            gen_backend=gen_backend,
+            llm_backend=llm_backend,
+            ortho_slices=ortho_slices,
+            volume_shape=volume_shape,
+            organelle=organelle,
+            initial_params=initial_params,
+            config=config,
+            output_dir=run_dir,
+            instance=instance,
+            mask_mode=mask_mode,
+            gen_model=gen_model_name,
+            resolution_nm=resolution_nm,
+            llm_model=getattr(args, "llm_model", "") or "",
+            use_video_predictor=getattr(args, "use_video_predictor", False),
+            multi_slice_points=getattr(args, "multi_slice_points", False),
+            point_sample=getattr(args, "point_sample", None),
+            point_backend=point_backend,
+            point_model=getattr(args, "point_model", "") or "",
+            point_prompt=getattr(args, "point_prompt", None),
+            z_start=args.z_start,
+            validate_points=getattr(args, "validate_points", False),
+            voxel_size=zarr_voxel_size,
+            offset=zarr_offset,
+            parallel_points=getattr(args, "parallel_points", False),
+        )
+
+        print(f"\n=== Ortho Z-Stack Done ===")
+        print(f"  Volume shape: {volume_shape}")
+        print(f"  Merged mask shape: {zstack_result.masks.shape}")
+        # Zarr output is already saved per-plane + merged inside run_ortho_zstack_refinement
+
+    elif use_zarr_zstack:
         from .agents.zstack import run_zstack_refinement
 
         zstack_result = run_zstack_refinement(
@@ -783,7 +884,11 @@ def cmd_refine(args: argparse.Namespace) -> None:
         save_zarr_path = getattr(args, "save_zarr", None)
         if save_zarr_path:
             from .zarr_io import save_masks_to_zarr
-            save_masks_to_zarr(zstack_result.masks, save_zarr_path)
+            save_masks_to_zarr(
+                zstack_result.masks, save_zarr_path,
+                voxel_size=zarr_voxel_size,
+                offset=zarr_offset,
+            )
     else:
         result = run_refinement_loop(
             gen_backend=gen_backend,
