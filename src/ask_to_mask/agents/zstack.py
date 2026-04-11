@@ -49,6 +49,7 @@ def run_zstack_refinement(
     point_prompt: str | None = None,
     z_start: int = 0,
     validate_points: bool = False,
+    pre_detected_points: dict[int, list[dict]] | None = None,
 ) -> ZStackResult:
     """Run refinement across a z-stack of slices.
 
@@ -58,10 +59,10 @@ def run_zstack_refinement(
     - Mode C: Per-slice Molmo points with SAM3 image predictor (no video)
     """
     is_sam3 = isinstance(gen_backend, SAM3Backend)
-    per_slice_points: dict[int, list[dict]] | None = None
+    per_slice_points: dict[int, list[dict]] | None = pre_detected_points
 
-    # Detect per-slice points if requested (use dedicated point_backend if provided)
-    if multi_slice_points and is_sam3:
+    # Detect per-slice points if requested and not already provided
+    if multi_slice_points and is_sam3 and per_slice_points is None:
         pb = point_backend or llm_backend
         pm = point_model or llm_model
         evaluator = EvaluatorAgent(pb, llm_model=pm, point_prompt=point_prompt)
@@ -342,3 +343,315 @@ def _overlay_mask_on_image(
     overlay_color = np.array(color, dtype=np.float32)
     base[fg] = base[fg] * (1 - alpha) + overlay_color * alpha
     return Image.fromarray(base.astype(np.uint8))
+
+
+# ---------------------------------------------------------------
+# Orthogonal plane processing (XY + XZ + YZ with majority vote)
+# ---------------------------------------------------------------
+
+
+def _parallel_molmo_detection(
+    ortho_slices: dict[str, tuple[list[Image.Image], np.ndarray]],
+    organelle: OrganelleClass,
+    point_backend: LLMBackend,
+    point_model: str,
+    point_prompt: str | None,
+    point_sample: int | None,
+) -> dict[str, dict[int, list[dict]]]:
+    """Run Molmo point detection for all 3 planes in parallel.
+
+    Spawns 3 concurrent batch Molmo subprocesses (one per plane),
+    each loading its own model instance. Requires ~3x Molmo VRAM (~60 GB).
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _detect_plane(plane: str) -> tuple[str, dict[int, list[dict]]]:
+        slices_list = ortho_slices[plane][0]
+        if not slices_list:
+            return plane, {}
+        print(f"  [parallel] Starting Molmo detection for {plane.upper()} ({len(slices_list)} slices)")
+        evaluator = EvaluatorAgent(
+            point_backend, llm_model=point_model, point_prompt=point_prompt
+        )
+        points = evaluator.generate_points_per_slice(
+            slices_list, organelle, sample_count=point_sample,
+        )
+        n_found = sum(1 for v in points.values() if v)
+        print(f"  [parallel] {plane.upper()} done: points on {n_found}/{len(slices_list)} slices")
+        return plane, points
+
+    planes = [p for p in ("xy", "xz", "yz") if ortho_slices.get(p, ([], None))[0]]
+    results: dict[str, dict[int, list[dict]]] = {}
+
+    print(f"\n=== Parallel Molmo detection across {len(planes)} planes ===")
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = {pool.submit(_detect_plane, p): p for p in planes}
+        for future in as_completed(futures):
+            plane, points = future.result()
+            results[plane] = points
+
+    return results
+
+
+def run_ortho_zstack_refinement(
+    gen_backend: ImageGenBackend,
+    llm_backend: LLMBackend,
+    ortho_slices: dict[str, tuple[list[Image.Image], np.ndarray]],
+    volume_shape: tuple[int, int, int],
+    organelle: OrganelleClass,
+    initial_params: GenerationParams,
+    config: LoopConfig = LoopConfig(),
+    output_dir: Path | None = None,
+    instance: bool = False,
+    mask_mode: str = "overlay",
+    gen_model: str = "",
+    resolution_nm: float | None = None,
+    llm_model: str = "",
+    use_video_predictor: bool = False,
+    multi_slice_points: bool = False,
+    point_sample: int | None = None,
+    point_backend: LLMBackend | None = None,
+    point_model: str = "",
+    point_prompt: str | None = None,
+    z_start: int = 0,
+    validate_points: bool = False,
+    voxel_size: tuple[float, ...] | None = None,
+    offset: tuple[float, ...] | None = None,
+    parallel_points: bool = False,
+) -> ZStackResult:
+    """Run segmentation on 3 orthogonal planes and merge via majority vote.
+
+    Processes XY, XZ, and YZ slices independently through the standard
+    z-stack pipeline, then reconstructs 3D masks for each plane and
+    combines them: a voxel is foreground if at least 2 of 3 planes agree.
+
+    Args:
+        ortho_slices: Dict from ``load_zarr_ortho_slices`` with keys
+            ``"xy"``, ``"xz"``, ``"yz"``, each mapping to
+            ``(slices, data_3d)``.
+        volume_shape: (Z, Y, X) shape of the 3D ROI in voxels.
+        parallel_points: If True, run Molmo point detection for all 3
+            planes in parallel (requires ~3x Molmo VRAM, ~60 GB).
+    """
+    nz, ny, nx = volume_shape
+    plane_masks_3d: dict[str, np.ndarray] = {}
+
+    # Optionally detect points for all planes in parallel before SAM3
+    pre_detected_points: dict[str, dict[int, list[dict]]] = {}
+    is_molmo = point_backend is not None and "molmo" in (point_model or "").lower()
+
+    if parallel_points and multi_slice_points and is_molmo:
+        pre_detected_points = _parallel_molmo_detection(
+            ortho_slices=ortho_slices,
+            organelle=organelle,
+            point_backend=point_backend,
+            point_model=point_model,
+            point_prompt=point_prompt,
+            point_sample=point_sample,
+        )
+
+    for plane in ("xy", "xz", "yz"):
+        slices_list = ortho_slices[plane][0]
+        if not slices_list:
+            print(f"\n=== Skipping {plane.upper()} plane (no slices) ===")
+            continue
+
+        plane_dir = output_dir / plane if output_dir else None
+        print(f"\n{'='*60}")
+        print(f"=== Processing {plane.upper()} plane ({len(slices_list)} slices) ===")
+        print(f"{'='*60}")
+
+        # If points were pre-detected in parallel, inject them so
+        # run_zstack_refinement skips its own Molmo detection
+        plane_params = initial_params
+        skip_multi_slice = False
+        if plane in pre_detected_points:
+            # Inject pre-detected points into per-slice params
+            # run_zstack_refinement will see multi_slice_points=True
+            # but the evaluator in _run_per_slice will find points
+            # already in params.extra["points"] and skip detection
+            skip_multi_slice = True
+
+        result = run_zstack_refinement(
+            gen_backend=gen_backend,
+            llm_backend=llm_backend,
+            slices=slices_list,
+            organelle=organelle,
+            initial_params=plane_params,
+            config=config,
+            output_dir=plane_dir,
+            instance=instance,
+            mask_mode=mask_mode,
+            gen_model=gen_model,
+            resolution_nm=resolution_nm,
+            llm_model=llm_model,
+            use_video_predictor=use_video_predictor,
+            multi_slice_points=multi_slice_points and not skip_multi_slice,
+            point_sample=point_sample,
+            point_backend=point_backend,
+            point_model=point_model,
+            point_prompt=point_prompt,
+            z_start=z_start if plane == "xy" else 0,
+            validate_points=validate_points,
+            pre_detected_points=pre_detected_points.get(plane),
+        )
+
+        # Reconstruct full 3D mask from per-plane 2D masks
+        plane_mask = _reconstruct_3d_mask(
+            result.masks, plane, volume_shape, ortho_slices
+        )
+        plane_masks_3d[plane] = plane_mask
+
+        # Save per-plane zarr immediately so results are visible during the run
+        if output_dir:
+            from ..zarr_io import save_masks_to_zarr
+            plane_zarr = output_dir / "masks.zarr"
+            save_masks_to_zarr(
+                plane_mask, str(plane_zarr), dataset_name=plane,
+                voxel_size=voxel_size, offset=offset,
+            )
+            print(f"  Saved {plane.upper()} plane mask to {plane_zarr}/{plane}")
+
+    # Majority vote: voxel is foreground if >= 2 planes agree
+    combined = _majority_vote(plane_masks_3d, volume_shape)
+
+    # Save combined mask PNGs and zarr
+    if output_dir:
+        merged_dir = output_dir / "merged"
+        merged_dir.mkdir(parents=True, exist_ok=True)
+        for z in range(combined.shape[0]):
+            mask_img = Image.fromarray(
+                (combined[z] > 0).astype(np.uint8) * 255, mode="L"
+            )
+            mask_img.save(merged_dir / f"z{z_start + z:04d}_mask.png")
+
+        # Save merged result to same zarr as per-plane masks
+        from ..zarr_io import save_masks_to_zarr
+        save_masks_to_zarr(
+            combined, str(output_dir / "masks.zarr"), dataset_name="merged",
+            voxel_size=voxel_size, offset=offset,
+        )
+
+        summary = {
+            "planes_processed": list(plane_masks_3d.keys()),
+            "volume_shape": list(volume_shape),
+            "merge_strategy": "majority_vote",
+        }
+        with open(output_dir / "ortho_summary.json", "w") as f:
+            json.dump(summary, f, indent=2)
+
+    return ZStackResult(
+        masks=combined,
+        per_slice_scores=[0.0] * nz,
+        per_slice_points=None,
+        total_slices=nz,
+    )
+
+
+def _reconstruct_3d_mask(
+    masks_2d: np.ndarray,
+    plane: str,
+    volume_shape: tuple[int, int, int],
+    ortho_slices: dict,
+) -> np.ndarray:
+    """Map 2D per-slice masks back into a 3D volume.
+
+    The masks_2d array has shape (n_slices, h, w) where n_slices is the
+    number of slices sampled along the slicing axis. We place each 2D
+    mask back at its original position in the volume.
+
+    Args:
+        masks_2d: (n_slices, h, w) mask stack from the pipeline.
+        plane: One of ``"xy"``, ``"xz"``, ``"yz"``.
+        volume_shape: (Z, Y, X) of the full ROI.
+        ortho_slices: The ortho_slices dict with actual slice indices.
+    """
+    nz, ny, nx = volume_shape
+    vol = np.zeros(volume_shape, dtype=np.uint8)
+
+    # Use the actual indices from loading (3rd element of the tuple)
+    indices = ortho_slices[plane][2]
+
+    if plane == "xy":
+        for i, z in enumerate(indices):
+            mask = (masks_2d[i] > 0).astype(np.uint8)
+            if mask.shape != (ny, nx):
+                from PIL import Image as PILImage
+                mask = np.array(
+                    PILImage.fromarray(mask * 255).resize((nx, ny), PILImage.NEAREST)
+                ) > 0
+                mask = mask.astype(np.uint8)
+            vol[z] = mask
+        vol = _interpolate_between_slices(vol, indices, axis=0)
+
+    elif plane == "xz":
+        for i, y in enumerate(indices):
+            mask = (masks_2d[i] > 0).astype(np.uint8)
+            if mask.shape != (nz, nx):
+                from PIL import Image as PILImage
+                mask = np.array(
+                    PILImage.fromarray(mask * 255).resize((nx, nz), PILImage.NEAREST)
+                ) > 0
+                mask = mask.astype(np.uint8)
+            vol[:, y, :] = mask
+        vol = _interpolate_between_slices(vol, indices, axis=1)
+
+    elif plane == "yz":
+        for i, x in enumerate(indices):
+            mask = (masks_2d[i] > 0).astype(np.uint8)
+            if mask.shape != (nz, ny):
+                from PIL import Image as PILImage
+                mask = np.array(
+                    PILImage.fromarray(mask * 255).resize((ny, nz), PILImage.NEAREST)
+                ) > 0
+                mask = mask.astype(np.uint8)
+            vol[:, :, x] = mask
+        vol = _interpolate_between_slices(vol, indices, axis=2)
+
+    return vol
+
+
+def _interpolate_between_slices(
+    vol: np.ndarray,
+    sampled_indices: list[int],
+    axis: int,
+) -> np.ndarray:
+    """Fill gaps between sampled slices via nearest-neighbor interpolation.
+
+    For each unsampled position along ``axis``, copies the mask from the
+    nearest sampled slice.
+    """
+    n = vol.shape[axis]
+    sampled = np.array(sampled_indices)
+
+    for i in range(n):
+        if i in sampled_indices:
+            continue
+        # Find nearest sampled index
+        nearest = sampled[np.argmin(np.abs(sampled - i))]
+        if axis == 0:
+            vol[i] = vol[nearest]
+        elif axis == 1:
+            vol[:, i, :] = vol[:, nearest, :]
+        else:
+            vol[:, :, i] = vol[:, :, nearest]
+
+    return vol
+
+
+def _majority_vote(
+    plane_masks: dict[str, np.ndarray],
+    volume_shape: tuple[int, int, int],
+) -> np.ndarray:
+    """Merge masks from multiple planes via majority vote.
+
+    A voxel is foreground if at least 2 of the available planes mark it
+    as foreground.
+    """
+    votes = np.zeros(volume_shape, dtype=np.uint8)
+    for mask in plane_masks.values():
+        votes += (mask > 0).astype(np.uint8)
+
+    n_planes = len(plane_masks)
+    threshold = max(1, (n_planes + 1) // 2)  # majority: 2 of 3
+    return (votes >= threshold).astype(np.uint8) * 255
