@@ -248,28 +248,178 @@ def get_zarr_info(
     }
 
 
+def load_zarr_ortho_slices(
+    zarr_path: str,
+    dataset_path: str | None = None,
+    roi: Roi | None = None,
+    z_step_nm: float | None = None,
+) -> dict[str, tuple[list[Image.Image], np.ndarray]]:
+    """Load slices from 3 orthogonal planes (XY, XZ, YZ) within an ROI.
+
+    Each plane is sampled to have a comparable number of slices: the
+    number of XY slices (along Z) is computed from the ROI, and the XZ
+    and YZ planes are uniformly sampled to the same count.
+
+    Args:
+        zarr_path: Path to zarr volume or group.
+        dataset_path: Optional sub-path within the zarr.
+        roi: Region of interest in world coordinates (nm).
+        z_step_nm: Optional Z subsampling step in nm.
+
+    Returns:
+        Dict with keys ``"xy"``, ``"xz"``, ``"yz"``.
+        Each value is ``(slices, data_3d)`` where slices is a list of
+        RGB PIL Images and data_3d is the loaded 3D ROI array.
+    """
+    data_3d, actual_roi, voxel_size = load_zarr_roi(
+        zarr_path, dataset_path, roi
+    )
+    nz, ny, nx = data_3d.shape
+
+    # XY slices (along Z axis) — standard
+    if z_step_nm is not None:
+        z_voxel = int(voxel_size[0])
+        z_stride = max(1, round(z_step_nm / z_voxel))
+    else:
+        z_stride = 1
+    xy_indices = list(range(0, nz, z_stride))
+    xy_slices = [_slice_to_rgb(data_3d[z]) for z in xy_indices]
+
+    # Sample XZ and YZ to get roughly the same number of slices as XY
+    n_target = len(xy_slices)
+
+    # XZ slices (along Y axis) — each slice is (Z, X)
+    xz_indices = np.linspace(0, ny - 1, min(n_target, ny), dtype=int).tolist()
+    xz_slices = [_slice_to_rgb(data_3d[:, y, :]) for y in xz_indices]
+
+    # YZ slices (along X axis) — each slice is (Z, Y)
+    yz_indices = np.linspace(0, nx - 1, min(n_target, nx), dtype=int).tolist()
+    yz_slices = [_slice_to_rgb(data_3d[:, :, x]) for x in yz_indices]
+
+    print(f"  Orthogonal slices: XY={len(xy_slices)}, XZ={len(xz_slices)}, YZ={len(yz_slices)}")
+    print(f"  Slice shapes: XY={ny}x{nx}, XZ={nz}x{nx}, YZ={nz}x{ny}")
+
+    return {
+        "xy": (xy_slices, data_3d, xy_indices),
+        "xz": (xz_slices, data_3d, xz_indices),
+        "yz": (yz_slices, data_3d, yz_indices),
+    }
+
+
 def save_masks_to_zarr(
     masks: np.ndarray,
     output_path: str,
     dataset_name: str = "masks",
     chunks: tuple[int, ...] | None = None,
+    voxel_size: tuple[float, ...] | None = None,
+    offset: tuple[float, ...] | None = None,
 ) -> None:
-    """Write a 3D mask stack (Z, H, W) to a zarr array.
+    """Write a 3D mask stack (Z, Y, X) as an OME-NGFF multiscale zarr v2.
+
+    Writes all metadata files manually to exactly match the CellMap/neuroglancer
+    zarr v2 convention with nested chunk directories.
+
+    Structure::
+
+        output_path/                    .zgroup + .zattrs (empty)
+          dataset_name/                 .zgroup + .zattrs (multiscales)
+            s0/                         .zarray + .zattrs (resolution/offset)
+              0/0/0, 0/0/1, ...         nested chunk dirs
 
     Args:
-        masks: 3D numpy array of masks.
+        masks: 3D numpy array of masks in ZYX order.
         output_path: Path for the output zarr store.
-        dataset_name: Name of the dataset within the store.
-        chunks: Chunk shape; defaults to (1, H, W) for per-slice access.
+        dataset_name: Name of the multiscale group (e.g. "merged", "xy").
+        chunks: Chunk shape; defaults to (128, 128, 128).
+        voxel_size: Voxel size in nm per axis (Z, Y, X).
+        offset: World offset in nm per axis (Z, Y, X).
     """
+    import gzip as _gzip
+    import json as _json
+    import shutil
+    from pathlib import Path as _Path
+
     if chunks is None:
-        chunks = (1, *masks.shape[1:])
-    arr = zarr.open_array(
-        f"{output_path}/{dataset_name}",
-        mode="w",
-        shape=masks.shape,
-        chunks=chunks,
-        dtype=masks.dtype,
-    )
-    arr[:] = masks
-    print(f"  Saved zarr masks: {output_path}/{dataset_name} {masks.shape}")
+        chunks = tuple(min(128, s) for s in masks.shape)
+
+    root_path = _Path(output_path)
+    group_path = root_path / dataset_name
+    array_path = group_path / "s0"
+
+    # Clean up old array
+    if array_path.exists():
+        shutil.rmtree(array_path)
+    array_path.mkdir(parents=True, exist_ok=True)
+
+    # Write .zgroup for root and dataset group
+    for gp in (root_path, group_path):
+        (gp / ".zgroup").write_text('{\n    "zarr_format": 2\n}')
+    # Root .zattrs — empty (no multiscales at root)
+    root_zattrs = root_path / ".zattrs"
+    if not root_zattrs.exists():
+        root_zattrs.write_text("{}")
+
+    # Write s0/.zarray — matching reference format exactly
+    zarray_meta = {
+        "chunks": list(chunks),
+        "compressor": {"id": "gzip", "level": 5},
+        "dimension_separator": "/",
+        "dtype": f"|{masks.dtype.str[1:]}",
+        "fill_value": 0,
+        "filters": None,
+        "order": "C",
+        "shape": list(masks.shape),
+        "zarr_format": 2,
+    }
+    (array_path / ".zarray").write_text(_json.dumps(zarray_meta, indent=4))
+
+    # Write s0/.zattrs with resolution and offset
+    scale = [float(v) for v in voxel_size] if voxel_size else [1.0, 1.0, 1.0]
+    translation = [float(v) for v in offset] if offset else [0.0, 0.0, 0.0]
+    (array_path / ".zattrs").write_text(_json.dumps({
+        "offset": translation,
+        "resolution": scale,
+    }, indent=4))
+
+    # Write dataset_name/.zattrs with OME-NGFF multiscales
+    (group_path / ".zattrs").write_text(_json.dumps({
+        "multiscales": [{
+            "axes": [
+                {"name": "z", "type": "space", "unit": "nanometer"},
+                {"name": "y", "type": "space", "unit": "nanometer"},
+                {"name": "x", "type": "space", "unit": "nanometer"},
+            ],
+            "coordinateTransformations": [{"scale": [1.0, 1.0, 1.0], "type": "scale"}],
+            "datasets": [{
+                "coordinateTransformations": [
+                    {"scale": scale, "type": "scale"},
+                    {"translation": translation, "type": "translation"},
+                ],
+                "path": "s0",
+            }],
+            "name": "",
+            "version": "0.4",
+        }],
+    }, indent=4))
+
+    # Write chunks as gzip-compressed nested directories (0/0/0, 0/0/1, ...)
+    # Edge chunks must be padded to the full chunk shape with fill_value (0).
+    cz, cy, cx = chunks
+    for zi in range(0, masks.shape[0], cz):
+        for yi in range(0, masks.shape[1], cy):
+            for xi in range(0, masks.shape[2], cx):
+                chunk = masks[zi:zi + cz, yi:yi + cy, xi:xi + cx]
+                # Pad edge chunks to full chunk size
+                if chunk.shape != (cz, cy, cx):
+                    padded = np.zeros((cz, cy, cx), dtype=masks.dtype)
+                    padded[:chunk.shape[0], :chunk.shape[1], :chunk.shape[2]] = chunk
+                    chunk = padded
+                chunk_key = f"{zi // cz}/{yi // cy}/{xi // cx}"
+                chunk_path = array_path / chunk_key
+                chunk_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(chunk_path, "wb") as f:
+                    f.write(_gzip.compress(chunk.tobytes(order="C"), compresslevel=5))
+
+    print(f"  Saved zarr: {output_path}/{dataset_name}/s0 {masks.shape}")
+    if voxel_size:
+        print(f"  Metadata: scale={scale}, offset={translation}")
