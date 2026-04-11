@@ -157,12 +157,20 @@ Respond with ONLY JSON:
 """
 
 
-MOLMO_POINTS_PROMPT = """\
-You are analyzing an electron microscopy (EM) image. \
-Point to multiple locations spread across each visible {organelle} in this image. \
-For each {organelle}, point to its center AND several points along its edges and extent — \
-not just one center point. This is especially important for large or elongated structures. \
-Aim for 3-5 points per small organelle and more for larger ones.\
+MOLMO_POINTS_PROMPT = "Point to each {organelle} in this EM image. They are dark, blobby shapes — oval, elongated, or irregular, not necessarily perfect circles."
+
+POINT_VALIDATION_PROMPT = """\
+You are validating whether a marked location in an electron microscopy (EM) image \
+correctly identifies a specific organelle. A red circle with crosshair marks the \
+location being evaluated.
+
+Look at the marked location and determine if it is on or very close to the target \
+organelle. Consider the surrounding context and morphology.
+
+Respond with ONLY JSON:
+{"valid": true, "reasoning": "brief reason"}
+or
+{"valid": false, "reasoning": "brief reason"}\
 """
 
 
@@ -176,12 +184,19 @@ class EvaluatorAgent:
         gen_model: str = "",
         resolution_nm: float | None = None,
         llm_model: str = "",
+        point_prompt: str | None = None,
+        point_backend: LLMBackend | None = None,
+        point_model: str = "",
     ):
         self.backend = backend
         self.instance = instance
         self.gen_model = gen_model
         self.resolution_nm = resolution_nm
-        self.is_molmo = "molmo" in llm_model.lower()
+        self.point_prompt = point_prompt
+        # Dedicated point detection backend/model (falls back to eval backend)
+        self.point_backend = point_backend or backend
+        self.point_model = point_model or llm_model
+        self.is_molmo = "molmo" in self.point_model.lower()
         # Stores VLM prompts used for the most recent initial generation call
         self.last_init_vlm_prompts: dict | None = None
 
@@ -278,13 +293,157 @@ class EvaluatorAgent:
         parts.append("\nIdentify each visible instance and provide center coordinates. Respond with JSON only.")
         user_prompt = "\n".join(parts)
 
-        raw = self.backend.chat_with_image(VLM_INITIAL_POINTS_PROMPT, user_prompt, em_image)
+        raw = self.point_backend.chat_with_image(VLM_INITIAL_POINTS_PROMPT, user_prompt, em_image)
         self.last_init_vlm_prompts = {
             "system": VLM_INITIAL_POINTS_PROMPT,
             "user": user_prompt,
             "raw_response": raw[:2000],
         }
         return self._parse_initial_points(raw, em_image)
+
+    def generate_points_per_slice(
+        self,
+        slices: list[Image.Image],
+        organelle: OrganelleClass,
+        sample_count: int | None = None,
+    ) -> dict[int, list[dict]]:
+        """Run Molmo on each slice independently to detect organelle points.
+
+        Args:
+            slices: List of RGB PIL Images (one per z-slice).
+            organelle: Organelle class to detect.
+            sample_count: If set, uniformly sample this many slices instead of all.
+
+        Returns:
+            Dict mapping slice index -> list of point dicts from Molmo.
+            Slices where Molmo finds nothing will have an empty list.
+        """
+        import numpy as np
+
+        n = len(slices)
+        if sample_count and sample_count < n:
+            # Uniformly sample slice indices
+            indices = np.linspace(0, n - 1, sample_count, dtype=int).tolist()
+        else:
+            indices = list(range(n))
+
+        # Use batch mode for Molmo native pointing (load model once)
+        if self.is_molmo:
+            per_slice_points = self._batch_molmo_points(
+                [slices[i] for i in indices], indices, organelle
+            )
+        else:
+            per_slice_points: dict[int, list[dict]] = {}
+            for idx in indices:
+                print(f"  Point detection: slice {idx+1}/{n}")
+                try:
+                    points = self.generate_initial_points(slices[idx], organelle)
+                    per_slice_points[idx] = points
+                    print(f"    Found {len(points)} points")
+                except Exception as e:
+                    print(f"    Failed: {e}")
+                    per_slice_points[idx] = []
+
+        # Fill in non-sampled slices with empty lists
+        for i in range(n):
+            if i not in per_slice_points:
+                per_slice_points[i] = []
+
+        return per_slice_points
+
+    def _batch_molmo_points(
+        self,
+        images: list[Image.Image],
+        indices: list[int],
+        organelle: OrganelleClass,
+    ) -> dict[int, list[dict]]:
+        """Run Molmo on multiple images in a single subprocess (batch mode).
+
+        Loads the model once and processes all images sequentially, avoiding
+        the per-image model loading overhead.
+        """
+        import json
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        prompt = self.point_prompt or MOLMO_POINTS_PROMPT.format(
+            organelle=organelle.name
+        )
+
+        project_root = Path(__file__).resolve().parents[3]
+        molmo_python = project_root / ".pixi" / "envs" / "molmo" / "bin" / "python"
+        script = project_root / "scripts" / "molmo_points.py"
+
+        if not molmo_python.exists():
+            raise RuntimeError(
+                f"Molmo pixi environment not found at {molmo_python}. "
+                "Run: pixi install -e molmo && pixi run -e molmo install-torch-cu126"
+            )
+
+        model_name = getattr(self.point_backend, "model_name", "allenai/Molmo2-8B")
+
+        # Save all images to temp files and create a JSON manifest
+        tmp_dir = tempfile.mkdtemp()
+        tmp_paths = []
+        for i, img in enumerate(images):
+            tmp_path = Path(tmp_dir) / f"slice_{i}.png"
+            img.save(tmp_path, format="PNG")
+            tmp_paths.append(str(tmp_path))
+
+        manifest_path = Path(tmp_dir) / "manifest.json"
+        with open(manifest_path, "w") as f:
+            json.dump(tmp_paths, f)
+
+        print(f"  Molmo batch: {len(images)} images in single subprocess")
+
+        try:
+            result = subprocess.run(
+                [
+                    str(molmo_python), str(script),
+                    "--images", str(manifest_path),
+                    "--prompt", prompt,
+                    "--model", model_name,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+
+            if result.returncode != 0:
+                raise RuntimeError(f"Molmo batch subprocess failed:\n{result.stderr[-1000:]}")
+
+            # Parse JSON array from last line of stdout
+            batch_results = json.loads(result.stdout.strip().split("\n")[-1])
+
+            per_slice_points: dict[int, list[dict]] = {}
+            for i, (idx, batch_result) in enumerate(zip(indices, batch_results)):
+                points = batch_result.get("points", [])
+                raw = batch_result.get("raw", "")
+                print(f"  Slice {idx+1}: {len(points)} points")
+                if points:
+                    per_slice_points[idx] = self._assign_instance_ids(points)
+                else:
+                    per_slice_points[idx] = []
+
+            return per_slice_points
+
+        except Exception as e:
+            print(f"  Molmo batch failed: {e}, falling back to sequential")
+            per_slice_points = {}
+            for i, idx in enumerate(indices):
+                try:
+                    points = self._generate_initial_points_molmo(images[i], organelle)
+                    per_slice_points[idx] = points
+                except Exception as e2:
+                    print(f"    Slice {idx} failed: {e2}")
+                    per_slice_points[idx] = []
+            return per_slice_points
+
+        finally:
+            # Clean up temp files
+            import shutil
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
     def _parse_initial_points(self, raw: str, em_image: Image.Image) -> list[dict]:
         """Extract point coordinates from the VLM's response."""
@@ -362,23 +521,80 @@ class EvaluatorAgent:
     def _generate_initial_points_molmo(
         self, em_image: Image.Image, organelle: OrganelleClass
     ) -> list[dict]:
-        """Use Molmo's native pointing capability to locate organelles."""
-        system_prompt = MOLMO_POINTS_PROMPT.format(organelle=organelle.name)
-        user_prompt = (
-            f"Point to multiple locations spread across each {organelle.name} in this image — "
-            f"center, edges, and along the extent of each one."
-        )
-        if organelle.description:
-            user_prompt += f" They appear as: {organelle.description}"
+        """Use Molmo's native pointing capability to locate organelles.
 
-        raw = self.backend.chat_with_image(system_prompt, user_prompt, em_image)
+        Runs Molmo2 in a subprocess using the 'molmo' pixi environment
+        (pinned to transformers <5 for compatibility).
+        """
+        import json
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        prompt = self.point_prompt or MOLMO_POINTS_PROMPT.format(
+            organelle=organelle.name
+        )
+
         self.last_init_vlm_prompts = {
-            "system": system_prompt,
-            "user": user_prompt,
-            "raw_response": raw[:2000],
+            "system": "",
+            "user": prompt,
         }
-        print(f"  Molmo raw response: {raw[:500]}")
-        return self._parse_molmo_points(raw, em_image)
+
+        # Save image to temp file for subprocess
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+            em_image.save(f, format="PNG")
+            tmp_path = f.name
+
+        try:
+            # Find the molmo env python and script
+            project_root = Path(__file__).resolve().parents[3]
+            molmo_python = project_root / ".pixi" / "envs" / "molmo" / "bin" / "python"
+            script = project_root / "scripts" / "molmo_points.py"
+
+            if not molmo_python.exists():
+                raise RuntimeError(
+                    f"Molmo pixi environment not found at {molmo_python}. "
+                    "Run: pixi install -e molmo && pixi run -e molmo install-torch-cu126"
+                )
+
+            model_name = getattr(self.backend, "model_name", "allenai/Molmo2-8B")
+
+            result = subprocess.run(
+                [
+                    str(molmo_python), str(script),
+                    "--image", tmp_path,
+                    "--prompt", prompt,
+                    "--model", model_name,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+
+            if result.returncode != 0:
+                raise RuntimeError(f"Molmo subprocess failed:\n{result.stderr[-1000:]}")
+
+            # Parse JSON from last line of stdout (skip any warnings on stderr)
+            output = json.loads(result.stdout.strip().split("\n")[-1])
+            raw = output.get("raw", "")
+            points = output.get("points", [])
+
+            self.last_init_vlm_prompts["raw_response"] = raw[:2000]
+            print(f"  Molmo raw response: {raw[:500]}")
+
+            if points:
+                print(f"  Molmo detected {len(points)} points")
+                return self._assign_instance_ids(points)
+
+        except Exception as e:
+            print(f"  Molmo subprocess error: {e}")
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+
+        # Fallback to image center
+        w, h = em_image.size
+        print("  Warning: could not get Molmo points, using image center as fallback")
+        return [{"x": w // 2, "y": h // 2, "label": 1, "instance": 0}]
 
     def _parse_molmo_points(self, raw: str, em_image: Image.Image) -> list[dict]:
         """Parse Molmo2's point output to pixel coordinates.
@@ -404,6 +620,15 @@ class EvaluatorAgent:
                 px_x = max(0, min(w - 1, int(float(m.group(2)) / 1000 * w)))
                 px_y = max(0, min(h - 1, int(float(m.group(3)) / 1000 * h)))
                 points.append({"x": px_x, "y": px_y, "label": 1})
+
+        # Fallback: bare coordinate triplets (when coords=" prefix was stripped)
+        if not points:
+            bare_match = re.search(r'((?:\d+\s+\d{3,4}\s+\d{3,4}\s*)+)"?\s*>', raw)
+            if bare_match:
+                for m in points_num_regex.finditer(bare_match.group(1)):
+                    px_x = max(0, min(w - 1, int(float(m.group(2)) / 1000 * w)))
+                    px_y = max(0, min(h - 1, int(float(m.group(3)) / 1000 * h)))
+                    points.append({"x": px_x, "y": px_y, "label": 1})
 
         if points:
             print(f"  Molmo2 detected {len(points)} points (coords format)")
@@ -440,6 +665,90 @@ class EvaluatorAgent:
     def _assign_instance_ids(points: list[dict]) -> list[dict]:
         """Assign each point its own unique instance ID."""
         return [{**p, "instance": i} for i, p in enumerate(points)]
+
+    def validate_points(
+        self,
+        em_image: Image.Image,
+        points: list[dict],
+        organelle: OrganelleClass,
+    ) -> list[dict]:
+        """Validate each point by marking it on the full image and asking the eval VLM.
+
+        For each point, draws a red circle + crosshair on a copy of the EM image
+        and asks the eval VLM whether the marked location is on the target organelle.
+        Returns only the points that the VLM confirms as valid.
+        """
+        import json
+        from PIL import ImageDraw
+
+        if not points:
+            return points
+
+        validated = []
+        marker_radius = max(8, min(em_image.size) // 40)
+
+        for i, pt in enumerate(points):
+            x, y = pt["x"], pt["y"]
+            label = pt.get("label", 1)
+
+            # Skip background points — only validate foreground
+            if label == 0:
+                validated.append(pt)
+                continue
+
+            # Draw marker on a copy of the EM image
+            marked = em_image.copy().convert("RGB")
+            draw = ImageDraw.Draw(marked)
+            r = marker_radius
+            # Red circle
+            draw.ellipse([x - r, y - r, x + r, y + r], outline="red", width=3)
+            # Crosshair
+            draw.line([x - r, y, x + r, y], fill="red", width=2)
+            draw.line([x, y - r, x, y + r], fill="red", width=2)
+
+            # Build user prompt
+            parts = [
+                f"The red marker is at pixel ({x}, {y}) in this {em_image.size[0]}x{em_image.size[1]} EM image.",
+                f"Target organelle: {organelle.name}.",
+            ]
+            if organelle.description:
+                parts.append(f"In EM, {organelle.name} appear as: {organelle.description}")
+            if self.resolution_nm is not None:
+                parts.append(f"Image resolution: {self.resolution_nm:.0f} nm/px.")
+            parts.append("Is the red marker correctly placed on this organelle? Respond with JSON only.")
+            user_prompt = "\n".join(parts)
+
+            try:
+                raw = self.backend.chat_with_image(
+                    POINT_VALIDATION_PROMPT, user_prompt, marked
+                )
+                # Parse response
+                json_str = raw.strip()
+                # Handle markdown code blocks
+                if "```" in json_str:
+                    json_str = json_str.split("```")[1]
+                    if json_str.startswith("json"):
+                        json_str = json_str[4:]
+                    json_str = json_str.strip()
+                result = json.loads(json_str)
+                is_valid = result.get("valid", True)
+                reasoning = result.get("reasoning", "")
+            except Exception as e:
+                # If parsing fails, keep the point (conservative)
+                print(f"  Point [{i}] ({x}, {y}): validation parse error ({e}), keeping")
+                validated.append(pt)
+                continue
+
+            status = "VALID" if is_valid else "REJECTED"
+            print(f"  Point [{i}] ({x}, {y}): {status} — {reasoning}")
+
+            if is_valid:
+                validated.append(pt)
+
+        accepted = sum(1 for p in validated if p.get("label", 1) == 1)
+        total_fg = sum(1 for p in points if p.get("label", 1) == 1)
+        print(f"  Point validation: {accepted}/{total_fg} foreground points accepted")
+        return validated
 
     def evaluate_and_refine_with_points(
         self,

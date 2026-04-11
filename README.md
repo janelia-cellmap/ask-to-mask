@@ -1,8 +1,8 @@
 # ask-to-mask
 
-Generate organelle segmentation masks from EM images using Flux image editing models.
+Generate organelle segmentation masks from EM images using vision-language models and SAM3.
 
-The idea: send an EM image to a Flux model with a prompt like *"Color all the mitochondria in bright red"*, then extract a binary segmentation mask from the color difference between the original and edited images.
+Supports multiple backends — Flux image editing, SAM3 with VLM-guided point prompts (including Molmo), Gemini, and Qwen — with an agentic refinement loop that iteratively improves masks using VLM feedback. Reads directly from zarr volumes and can process orthogonal planes (XY, XZ, YZ) with majority-vote merging for robust 3D segmentation.
 
 ## Setup
 
@@ -11,6 +11,10 @@ Requires [pixi](https://pixi.sh).
 ```bash
 pixi install
 pixi run install-torch-cu126
+
+# For Molmo2 point detection (separate env with transformers <5)
+pixi install -e molmo
+pixi run -e molmo install-torch-cu126
 ```
 
 ## Usage
@@ -34,6 +38,65 @@ pixi run segment segment --input-dir ./em_images/ --output-dir ./masks/ --organe
 `--save-colored` saves the intermediate colored image alongside the mask for visual inspection.
 
 When `--resolution` is provided (in nm/pixel), prompts include organelle descriptions and expected sizes in pixels, helping the model distinguish organelles by scale.
+
+### Segment from zarr volumes
+
+Read EM slices directly from zarr files instead of requiring pre-exported PNGs:
+
+```bash
+# Single slice from a zarr volume
+pixi run segment segment --zarr-path /path/to/volume.zarr/recon-1/em/fibsem-uint8/s0 \
+  --z-start 100 --output-dir ./masks/ --organelles mito --save-colored
+
+# Z-stack: 5 consecutive slices
+pixi run segment segment --zarr-path /path/to/volume.zarr/recon-1/em/fibsem-uint8/s0 \
+  --z-start 100 --z-count 5 --output-dir ./masks/ --organelles mito
+
+# With sub-path navigation and stride
+pixi run segment segment --zarr-path /path/to/volume.zarr/recon-1/em/fibsem-uint8 \
+  --dataset-path s0 --z-start 100 --z-count 10 --z-step 2 --output-dir ./masks/ --organelles mito
+
+# Save 3D mask stack as zarr
+pixi run segment segment --zarr-path /path/to/volume.zarr/recon-1/em/fibsem-uint8/s0 \
+  --z-start 100 --z-count 5 --output-dir ./masks/ --organelles mito --save-zarr ./masks/stack.zarr
+```
+
+**ROI in world coordinates (nm)** — crop to a specific region instead of full slices:
+
+```bash
+# ROI format: [z_start:z_end, y_start:y_end, x_start:x_end] in nm
+pixi run segment segment --zarr-path /path/to/volume.zarr/recon-1/em/fibsem-uint8/s0 \
+  --roi "[4000:5000, 4000:8000, 4000:8000]" --output-dir ./masks/ --organelles mito
+```
+
+Uses `funlib.geometry.Roi` under the hood — ROI is snapped to the voxel grid and intersected with available data.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--zarr-path` | None | Path to zarr volume or group |
+| `--dataset-path` | None | Sub-path within zarr (e.g., `s0`) |
+| `--z-start` | `0` | First Z slice index |
+| `--z-count` | `1` | Number of Z slices to process |
+| `--z-step` | `1` | Step between Z slices |
+| `--roi` | None | ROI in world coords (nm), e.g. `[500:1000,500:1000,1000:11000]`. Overrides z-start/z-count/z-step |
+| `--z-step-nm` | None | Z spacing in nm when using `--roi` (e.g. `40` reads every 40 nm). Default: every voxel |
+| `--save-zarr` | None | Path to save 3D mask stack as zarr |
+
+### YAML config files
+
+All CLI flags can be set in a YAML config file. CLI flags override config values. Both `segment` and `refine` subcommands support `--config`.
+
+```bash
+pixi run segment refine --config configs/refine_zarr_example.yaml
+
+# Override a config value from CLI
+pixi run segment refine --config configs/refine_zarr_example.yaml --organelle er
+
+# Also works with segment
+pixi run segment segment --config configs/my_segment_config.yaml
+```
+
+See [configs/refine_zarr_example.yaml](configs/refine_zarr_example.yaml) for a full example.
 
 ### Instance segmentation
 
@@ -217,6 +280,89 @@ The VLM-coordinate strategy also supports a HuggingFace backend (`--llm-provider
 
 Output intermediates include `colored.png` (semi-transparent overlay of instance masks on the EM image), `mask.png` (color-coded instance labels), `points.png` (point prompts visualized on the EM), and `evaluation.json`.
 
+### Z-stack refinement with zarr
+
+Refine segmentation across multiple z-slices from a zarr volume. The SAM3 video predictor can propagate masks across slices for consistent 3D segmentation.
+
+```bash
+# Independent per-slice refinement (any backend)
+pixi run segment refine --zarr-path /path/to/volume.zarr/recon-1/em/fibsem-uint8/s0 \
+  --z-start 100 --z-count 5 --output-dir ./refined/ --organelle mito \
+  --gen-backend sam3 --sam3-strategy text --llm-provider google
+
+# SAM3 video predictor: propagate masks across slices
+pixi run segment refine --zarr-path /path/to/volume.zarr/recon-1/em/fibsem-uint8/s0 \
+  --z-start 100 --z-count 10 --output-dir ./refined/ --organelle mito \
+  --gen-backend sam3 --sam3-strategy vlm-coordinate --use-video-predictor \
+  --llm-provider google
+
+# Per-slice Molmo point detection + video predictor propagation
+pixi run segment refine --zarr-path /path/to/volume.zarr/recon-1/em/fibsem-uint8/s0 \
+  --z-start 100 --z-count 10 --output-dir ./refined/ --organelle mito \
+  --gen-backend sam3 --sam3-strategy vlm-coordinate --use-video-predictor \
+  --multi-slice-points --llm-provider google
+
+# Save 3D mask stack as zarr
+pixi run segment refine --zarr-path /path/to/volume.zarr/recon-1/em/fibsem-uint8/s0 \
+  --z-start 100 --z-count 5 --output-dir ./refined/ --organelle mito \
+  --gen-backend sam3 --use-video-predictor --save-zarr ./refined/masks.zarr
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--use-video-predictor` | off | Use SAM3 video predictor for cross-slice mask propagation |
+| `--multi-slice-points` | off | Run Molmo independently on each slice to find points |
+| `--point-sample` | all | Number of slices to sample for Molmo point detection |
+| `--point-provider` | same as `--llm-provider` | VLM provider for point detection (e.g. `huggingface` for Molmo) |
+| `--point-model` | None | VLM model for point detection (e.g. `allenai/Molmo2-8B`) |
+| `--point-prompt` | `"Point to the {organelle}"` | Custom prompt for Molmo point detection |
+| `--skip-refinement` | off | Skip iterative evaluation/refinement loop — just detect points and run SAM3 once |
+
+When `--multi-slice-points` is combined with `--use-video-predictor`, Molmo runs on each slice independently to find organelle locations, then those per-slice points are fed as frame-specific prompts to the SAM3 video predictor. The video predictor propagates masks forward and backward, handling cross-slice consistency and filling in slices where Molmo found nothing.
+
+Batch Molmo detection: when using `--multi-slice-points` with Molmo, all slices are processed in a single subprocess call (loading the model once) rather than spawning a new process per slice.
+
+### Orthogonal plane segmentation
+
+Process all 3 orthogonal planes (XY, XZ, YZ) from a zarr ROI and merge via majority vote for more robust 3D segmentation. A voxel is marked foreground if at least 2 of 3 planes agree.
+
+```bash
+# Ortho mode: process XY, XZ, YZ planes and merge
+pixi run segment refine --zarr-path /path/to/volume.zarr/recon-1/em/fibsem-uint8/s0 \
+  --roi "[4000:5000, 4000:8000, 4000:8000]" --output-dir ./refined/ --organelle mito \
+  --gen-backend sam3 --sam3-strategy vlm-coordinate --multi-slice-points \
+  --point-provider huggingface --point-model allenai/Molmo2-8B \
+  --skip-refinement --ortho
+
+# Parallel point detection across planes (~60 GB VRAM needed)
+pixi run segment refine --zarr-path /path/to/volume.zarr/recon-1/em/fibsem-uint8/s0 \
+  --roi "[4000:5000, 4000:8000, 4000:8000]" --output-dir ./refined/ --organelle mito \
+  --gen-backend sam3 --sam3-strategy vlm-coordinate --multi-slice-points \
+  --point-provider huggingface --point-model allenai/Molmo2-8B \
+  --skip-refinement --ortho --parallel-points
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--ortho` | off | Process XY, XZ, YZ planes and merge via majority vote |
+| `--parallel-points` | off | Run Molmo detection for all 3 planes concurrently (~3x VRAM) |
+
+Output structure with `--ortho`:
+- `xy/`, `xz/`, `yz/` — per-plane slice results
+- `masks.zarr/xy/s0`, `masks.zarr/xz/s0`, `masks.zarr/yz/s0` — per-plane 3D masks
+- `masks.zarr/merged/s0` — majority-vote merged mask
+- `merged/` — PNG slices of the merged mask
+- `ortho_summary.json` — processing metadata
+
+Zarr output uses OME-NGFF v0.4 multiscale format with voxel size and offset metadata, compatible with neuroglancer and other zarr viewers.
+
+### Run metadata
+
+Every `refine` run automatically saves reproducibility metadata to the output directory:
+- `config.yaml` — copy of the YAML config file (if `--config` was used)
+- `args.json` — all resolved CLI arguments (CLI flags merged with config)
+- `command.txt` — the original command line
+
 
 ## LoRA finetuning
 
@@ -295,21 +441,26 @@ src/ask_to_mask/
   model.py         # Flux model loading and inference (with LoRA support)
   pipeline.py      # Orchestrates load → prompt → infer → postprocess
   postprocess.py   # Mask extraction (semantic + instance)
+  zarr_io.py       # Zarr I/O: load slices, z-stacks, orthogonal planes, and save OME-NGFF zarr
   agents/
     gen_backend.py      # Pluggable image generation backends (Flux, Gemini, GLM, Qwen)
-    sam3_backend.py     # SAM3 segmentation backend (text, VLM-coordinate, painted-marker)
+    sam3_backend.py     # SAM3 segmentation backend (text, VLM-coordinate, painted-marker, video predictor)
     marker_detection.py # Colored marker detection for SAM3 painted-marker strategy
-    llm_backend.py      # Pluggable LLM/VLM backends (ollama, Anthropic, Google, OpenAI)
-    evaluator.py        # Combined critic+refiner agent (with SAM3 point refinement)
+    llm_backend.py      # Pluggable LLM/VLM backends (ollama, Anthropic, Google, OpenAI, HuggingFace)
+    evaluator.py        # Combined critic+refiner agent (with SAM3 point refinement + per-slice Molmo)
     loop.py             # Generate-evaluate-refine orchestrator
+    zstack.py           # Z-stack orchestrator: multi-slice refinement, orthogonal plane majority vote
     schemas.py          # Dataclasses for structured data exchange
   training/
     dataset.py     # CellMapFluxDataset: zarr-backed training data
     zarr_utils.py  # Zarr reading utilities (adapted from sam3m)
     train.py       # LoRA training loop with accelerate + PEFT
 scripts/
+  molmo_points.py       # Standalone Molmo2 inference script (runs in molmo pixi env)
   preview_crop_norms.py # Preview and auto-compute intensity normalization per dataset
 configs/
+  refine_ortho_example.yaml                    # Example config for orthogonal plane refinement
+  refine_zarr_example.yaml                     # Example config for z-stack zarr refinement
   train_lora.yaml                  # Kontext training configuration
   train_lora_flux2.yaml            # Flux2-dev training configuration
   train_lora_flux2_r64_autonorm.yaml           # Flux2-dev with auto-norms, rank 64

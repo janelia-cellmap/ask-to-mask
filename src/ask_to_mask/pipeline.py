@@ -78,7 +78,7 @@ def overlay_on_raw(raw: Image.Image, colored: Image.Image, alpha: float = 0.5) -
 
 def segment_single(
     pipe,
-    image_path: str | Path,
+    image_path: str | Path | None,
     organelle: OrganelleClass,
     output_dir: str | Path,
     model_key: str = "",
@@ -92,8 +92,12 @@ def segment_single(
     instance: bool = False,
     detailed_prompt: bool = False,
     resolution_nm: float | None = None,
+    image: Image.Image | None = None,
+    image_stem: str | None = None,
 ) -> Path:
     """Run the full pipeline for one image and one organelle class.
+
+    Either ``image_path`` or ``image`` (with ``image_stem``) must be provided.
 
     Returns:
         Path to the saved mask file.
@@ -101,8 +105,13 @@ def segment_single(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    image_path = Path(image_path)
-    img = load_em_image(image_path)
+    if image is not None:
+        img = image
+        image_stem = image_stem or "slice"
+    else:
+        image_path = Path(image_path)
+        img = load_em_image(image_path)
+        image_stem = image_path.stem
     original_size = img.size  # (W, H)
 
     # Pad to square to preserve aspect ratio, then resize for inference
@@ -134,7 +143,7 @@ def segment_single(
     result_cropped = unpad(result, crop_box, TARGET_SIZE)
 
     # Organize outputs into subdirectories: output_dir/image_stem/model_key/
-    sub_dir = output_dir / image_path.stem / model_key
+    sub_dir = output_dir / image_stem / model_key
     sub_dir.mkdir(parents=True, exist_ok=True)
 
     # Optionally save the colored intermediate and overlay at original size
@@ -172,12 +181,15 @@ def segment_single(
 
 def segment(
     pipe,
-    image_path: str | Path,
+    image_path: str | Path | None,
     organelle_keys: list[str],
     output_dir: str | Path,
     **kwargs,
 ) -> list[Path]:
     """Run segmentation for multiple organelle classes on one image.
+
+    ``image_path`` can be ``None`` if ``image`` and ``image_stem`` are passed
+    via ``**kwargs``.
 
     Returns:
         List of paths to saved mask files.

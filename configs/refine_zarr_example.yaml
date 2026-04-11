@@ -1,0 +1,57 @@
+# Example config for z-stack refinement from a zarr volume.
+# Usage: pixi run segment refine --config configs/refine_zarr_example.yaml
+#
+# CLI flags override any values set here.
+
+# Input
+zarr_path: /nrs/cellmap/data/jrc_mus-liver/jrc_mus-liver.zarr/recon-1/em/fibsem-uint8/s0
+# dataset_path: s0  # use if zarr_path points to a group, not an array
+
+# ROI in world coordinates (nm) — z:z, y:y, x:x
+roi: "[4000:4080, 4000:8000, 4000:8000]"
+# Z spacing in nm (subsample slices within the ROI). Default: every voxel.
+# z_step_nm: 40  # every 40nm = every 5th voxel at 8nm/voxel
+
+# Or use index-based slicing instead of roi:
+# z_start: 500
+# z_count: 10
+# z_step: 1
+
+# Output
+output_dir: ./outputs/refined/
+save_zarr: ./outputs/refined/masks.zarr
+
+# Organelle
+organelle: mito
+
+# Generation backend
+gen_backend: sam3
+sam3_strategy: vlm-coordinate
+sam3_model: facebook/sam3
+sam3_confidence: 0.5
+
+# Z-stack options
+use_video_predictor: false # true
+multi_slice_points: true
+point_sample: 5  # sample N slices for Molmo instead of all
+
+# Evaluation (reasoning / scoring)
+# llm_provider: google
+# llm_model: gemini-2.0-flash
+llm_provider: ollama
+llm_model: qwen2.5vl:72b
+max_iterations: 5
+min_score: 0.95
+
+# Point detection (spatial pointing — Molmo has native pointing capability)
+point_provider: huggingface
+point_model: allenai/Molmo2-8B
+point_prompt: "Point to the ovular, cylindrical, circular mitochondria organelles in this EM image"
+
+# Skip iterative refinement — just detect points + run SAM3 once
+skip_refinement: true
+
+# Other
+device: cuda
+resolution: 4.0
+instance: false

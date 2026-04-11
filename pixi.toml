@@ -9,6 +9,7 @@ platforms = ["linux-64"]
 python = "3.12.*"
 pip = "*"
 setuptools = ">=70,<81"
+imageio-ffmpeg = ">=0.6.0,<0.7"
 
 [pypi-dependencies]
 ask-to-mask = { path = ".", editable = true }
@@ -18,3 +19,18 @@ install-torch-cu126 = "pip install torch torchvision --index-url https://downloa
 install-train-deps = "pip install -e '.[train]'"
 segment = "python -m ask_to_mask.cli"
 train = "python -m ask_to_mask.cli train"
+
+# Molmo environment: pinned transformers <5 for Molmo2-8B compatibility
+[feature.molmo.pypi-dependencies]
+transformers = ">=4.46,<5"
+accelerate = "*"
+Pillow = "*"
+einops = "*"
+
+[feature.molmo.tasks]
+install-torch-cu126 = "pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126"
+molmo-points = "python scripts/molmo_points.py"
+
+[environments]
+default = { features = [], solve-group = "default" }
+molmo = { features = ["molmo"], solve-group = "molmo" }

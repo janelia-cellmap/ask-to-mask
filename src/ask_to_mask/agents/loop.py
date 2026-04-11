@@ -96,6 +96,9 @@ def run_refinement_loop(
     gen_model: str = "",
     resolution_nm: float | None = None,
     llm_model: str = "",
+    point_backend: LLMBackend | None = None,
+    point_model: str = "",
+    validate_points: bool = False,
 ) -> LoopResult:
     """Run the generate-evaluate-refine loop.
 
@@ -103,27 +106,46 @@ def run_refinement_loop(
     revert if worse. Cycle through params systematically. The evaluator only
     refines the prompt — param tuning is done here.
     """
-    evaluator = EvaluatorAgent(
-        backend=llm_backend,
-        instance=instance,
-        gen_model=gen_model,
-        resolution_nm=resolution_nm,
-        llm_model=llm_model,
-    )
-
     # Check if this is a SAM3 point-based strategy
     sam3_strategy = initial_params.extra.get("sam3_strategy")
     use_points = sam3_strategy == "vlm-coordinate"
-
     use_sam3_text = sam3_strategy == "text"
+    existing_points = initial_params.extra.get("points") if use_points else None
+
+    # Skip evaluator creation when it won't be used (single iteration + points pre-injected)
+    if config.max_iterations == 1 and existing_points:
+        evaluator = None
+    else:
+        evaluator = EvaluatorAgent(
+            backend=llm_backend,
+            instance=instance,
+            gen_model=gen_model,
+            resolution_nm=resolution_nm,
+            llm_model=llm_model,
+            point_backend=point_backend,
+            point_model=point_model,
+        )
 
     if use_points:
-        # Generate initial point coordinates via VLM
-        print("\n=== Generating initial points via VLM ===")
-        points = evaluator.generate_initial_points(em_image, organelle)
-        print(f"  Initial points: {len(points)} locations")
-        for p in points:
-            print(f"    ({p['x']}, {p['y']}) label={p.get('label', 1)}")
+        if existing_points:
+            print(f"\n=== Using pre-detected points ({len(existing_points)} locations) ===")
+            for p in existing_points:
+                print(f"    ({p['x']}, {p['y']}) label={p.get('label', 1)}")
+            points = existing_points
+        else:
+            print("\n=== Generating initial points via VLM ===")
+            points = evaluator.generate_initial_points(em_image, organelle)
+            print(f"  Initial points: {len(points)} locations")
+            for p in points:
+                print(f"    ({p['x']}, {p['y']}) label={p.get('label', 1)}")
+        # Optionally validate each point via the eval VLM
+        if validate_points and points:
+            print("\n=== Validating points via eval VLM ===")
+            points = evaluator.validate_points(em_image, points, organelle)
+            if not points:
+                print("  Warning: all points were rejected, using image center as fallback")
+                w, h = em_image.size
+                points = [{"x": w // 2, "y": h // 2, "label": 1, "instance": 0}]
         initial_params = _with_extra(
             initial_params, {**initial_params.extra, "points": points}
         )
@@ -165,14 +187,15 @@ def run_refinement_loop(
     param_effects: list[dict] = []
 
     for iteration in range(config.max_iterations):
-        print(f"\n=== Iteration {iteration + 1}/{config.max_iterations} ===")
-        print(f"  Prompt: {current_params.prompt}")
-        param_strs = []
-        if current_params.strength is not None:
-            param_strs.append(f"strength={current_params.strength:.3f}")
-        param_strs.append(f"guidance_scale={current_params.guidance_scale:.2f}")
-        param_strs.append(f"num_inference_steps={current_params.num_inference_steps}")
-        print(f"  Params: {', '.join(param_strs)}")
+        if config.max_iterations > 1:
+            print(f"\n=== Iteration {iteration + 1}/{config.max_iterations} ===")
+            print(f"  Prompt: {current_params.prompt}")
+            param_strs = []
+            if current_params.strength is not None:
+                param_strs.append(f"strength={current_params.strength:.3f}")
+            param_strs.append(f"guidance_scale={current_params.guidance_scale:.2f}")
+            param_strs.append(f"num_inference_steps={current_params.num_inference_steps}")
+            print(f"  Params: {', '.join(param_strs)}")
 
         # Step 1: Generate
         try:
@@ -205,7 +228,7 @@ def run_refinement_loop(
                         raw_response="",
                     ),
                     current_params,
-                    init_vlm_prompts=evaluator.last_init_vlm_prompts if iteration == 0 else None,
+                    init_vlm_prompts=getattr(evaluator, "last_init_vlm_prompts", None) if iteration == 0 else None,
                 )
             continue
         all_results.append(result)
@@ -214,7 +237,38 @@ def run_refinement_loop(
         if config.save_intermediates and output_dir:
             _save_iteration(output_dir, iteration, result, em_image)
 
-        # Step 2: Evaluate
+        # Step 2: Evaluate (skip if single iteration — no refinement needed)
+        if config.max_iterations == 1:
+            # No evaluation needed — just save generation info and return
+            dummy_eval = EvaluationResult(
+                score=0.0,
+                detailed_scores=None,
+                issues=[],
+                refined_prompt=None,
+                param_adjustments={},
+                should_stop=True,
+                reasoning="skipped (single iteration)",
+                raw_response="",
+            )
+            all_evaluations.append(dummy_eval)
+            if config.save_intermediates and output_dir:
+                _save_evaluation(
+                    output_dir,
+                    iteration,
+                    dummy_eval,
+                    current_params,
+                    init_vlm_prompts=getattr(evaluator, "last_init_vlm_prompts", None) if iteration == 0 else None,
+                )
+            print("  Evaluation skipped (single iteration)")
+            return LoopResult(
+                best_result=result,
+                best_evaluation=dummy_eval,
+                all_results=all_results,
+                all_evaluations=all_evaluations,
+                total_iterations=1,
+                converged=False,
+            )
+
         if use_points:
             evaluation = evaluator.evaluate_and_refine_with_points(
                 em_image, result, organelle, history
