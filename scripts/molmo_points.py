@@ -142,42 +142,64 @@ def main():
     _load_dotenv()
 
     parser = argparse.ArgumentParser(description="Molmo2 point detection")
-    parser.add_argument("--image", required=True, help="Path to input image")
+    parser.add_argument("--image", default=None, help="Path to input image (single mode)")
+    parser.add_argument("--images", default=None, help="Path to JSON file listing image paths (batch mode)")
     parser.add_argument("--prompt", required=True, help="Prompt for point detection")
     parser.add_argument(
         "--model", default="allenai/Molmo2-8B", help="HuggingFace model name"
     )
     parser.add_argument(
-        "--output", default=None, help="Save image with points drawn (PNG path)"
+        "--output", default=None, help="Save image with points drawn (PNG path, single mode only)"
     )
     args = parser.parse_args()
 
-    image = Image.open(args.image).convert("RGB")
-    w, h = image.size
+    if not args.image and not args.images:
+        parser.error("Either --image or --images is required")
 
     # Suppress warnings to keep stdout clean for JSON
     import warnings
     warnings.filterwarnings("ignore")
 
     processor, model = load_model(args.model)
-    raw = generate(processor, model, image, args.prompt)
-    points = parse_points(raw, w, h)
 
-    if args.output and points:
-        from PIL import ImageDraw
+    if args.images:
+        # Batch mode: process multiple images, output one JSON line per image
+        with open(args.images) as f:
+            image_paths = json.loads(f.read())
 
-        vis = image.copy()
-        draw = ImageDraw.Draw(vis)
-        r = max(3, min(w, h) // 100)
-        for i, pt in enumerate(points):
-            x, y = pt["x"], pt["y"]
-            draw.ellipse([x - r, y - r, x + r, y + r], fill="red", outline="white")
-            draw.text((x + r + 2, y - r), str(i), fill="red")
-        vis.save(args.output)
-        print(f"Saved visualization to {args.output}", file=sys.stderr)
+        results = []
+        for img_path in image_paths:
+            image = Image.open(img_path).convert("RGB")
+            w, h = image.size
+            raw = generate(processor, model, image, args.prompt)
+            points = parse_points(raw, w, h)
+            results.append({"points": points, "raw": raw[:2000]})
+            print(f"Processed {img_path}: {len(points)} points", file=sys.stderr)
 
-    result = {"points": points, "raw": raw[:2000]}
-    print(json.dumps(result))
+        print(json.dumps(results))
+    else:
+        # Single image mode
+        image = Image.open(args.image).convert("RGB")
+        w, h = image.size
+
+        raw = generate(processor, model, image, args.prompt)
+        points = parse_points(raw, w, h)
+
+        if args.output and points:
+            from PIL import ImageDraw
+
+            vis = image.copy()
+            draw = ImageDraw.Draw(vis)
+            r = max(3, min(w, h) // 100)
+            for i, pt in enumerate(points):
+                x, y = pt["x"], pt["y"]
+                draw.ellipse([x - r, y - r, x + r, y + r], fill="red", outline="white")
+                draw.text((x + r + 2, y - r), str(i), fill="red")
+            vis.save(args.output)
+            print(f"Saved visualization to {args.output}", file=sys.stderr)
+
+        result = {"points": points, "raw": raw[:2000]}
+        print(json.dumps(result))
 
 
 if __name__ == "__main__":

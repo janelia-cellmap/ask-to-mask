@@ -157,7 +157,7 @@ Respond with ONLY JSON:
 """
 
 
-MOLMO_POINTS_PROMPT = "Point to the center of each {organelle} in this electron microscopy image. {description}Point to each separate instance individually."
+MOLMO_POINTS_PROMPT = "Point to each {organelle} in this EM image. They are dark, blobby shapes — oval, elongated, or irregular, not necessarily perfect circles."
 
 POINT_VALIDATION_PROMPT = """\
 You are validating whether a marked location in an electron microscopy (EM) image \
@@ -327,16 +327,22 @@ class EvaluatorAgent:
         else:
             indices = list(range(n))
 
-        per_slice_points: dict[int, list[dict]] = {}
-        for idx in indices:
-            print(f"  Molmo point detection: slice {idx+1}/{n}")
-            try:
-                points = self.generate_initial_points(slices[idx], organelle)
-                per_slice_points[idx] = points
-                print(f"    Found {len(points)} points")
-            except Exception as e:
-                print(f"    Failed: {e}")
-                per_slice_points[idx] = []
+        # Use batch mode for Molmo native pointing (load model once)
+        if self.is_molmo:
+            per_slice_points = self._batch_molmo_points(
+                [slices[i] for i in indices], indices, organelle
+            )
+        else:
+            per_slice_points: dict[int, list[dict]] = {}
+            for idx in indices:
+                print(f"  Point detection: slice {idx+1}/{n}")
+                try:
+                    points = self.generate_initial_points(slices[idx], organelle)
+                    per_slice_points[idx] = points
+                    print(f"    Found {len(points)} points")
+                except Exception as e:
+                    print(f"    Failed: {e}")
+                    per_slice_points[idx] = []
 
         # Fill in non-sampled slices with empty lists
         for i in range(n):
@@ -344,6 +350,100 @@ class EvaluatorAgent:
                 per_slice_points[i] = []
 
         return per_slice_points
+
+    def _batch_molmo_points(
+        self,
+        images: list[Image.Image],
+        indices: list[int],
+        organelle: OrganelleClass,
+    ) -> dict[int, list[dict]]:
+        """Run Molmo on multiple images in a single subprocess (batch mode).
+
+        Loads the model once and processes all images sequentially, avoiding
+        the per-image model loading overhead.
+        """
+        import json
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        prompt = self.point_prompt or MOLMO_POINTS_PROMPT.format(
+            organelle=organelle.name
+        )
+
+        project_root = Path(__file__).resolve().parents[3]
+        molmo_python = project_root / ".pixi" / "envs" / "molmo" / "bin" / "python"
+        script = project_root / "scripts" / "molmo_points.py"
+
+        if not molmo_python.exists():
+            raise RuntimeError(
+                f"Molmo pixi environment not found at {molmo_python}. "
+                "Run: pixi install -e molmo && pixi run -e molmo install-torch-cu126"
+            )
+
+        model_name = getattr(self.point_backend, "model_name", "allenai/Molmo2-8B")
+
+        # Save all images to temp files and create a JSON manifest
+        tmp_dir = tempfile.mkdtemp()
+        tmp_paths = []
+        for i, img in enumerate(images):
+            tmp_path = Path(tmp_dir) / f"slice_{i}.png"
+            img.save(tmp_path, format="PNG")
+            tmp_paths.append(str(tmp_path))
+
+        manifest_path = Path(tmp_dir) / "manifest.json"
+        with open(manifest_path, "w") as f:
+            json.dump(tmp_paths, f)
+
+        print(f"  Molmo batch: {len(images)} images in single subprocess")
+
+        try:
+            result = subprocess.run(
+                [
+                    str(molmo_python), str(script),
+                    "--images", str(manifest_path),
+                    "--prompt", prompt,
+                    "--model", model_name,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+
+            if result.returncode != 0:
+                raise RuntimeError(f"Molmo batch subprocess failed:\n{result.stderr[-1000:]}")
+
+            # Parse JSON array from last line of stdout
+            batch_results = json.loads(result.stdout.strip().split("\n")[-1])
+
+            per_slice_points: dict[int, list[dict]] = {}
+            for i, (idx, batch_result) in enumerate(zip(indices, batch_results)):
+                points = batch_result.get("points", [])
+                raw = batch_result.get("raw", "")
+                print(f"  Slice {idx+1}: {len(points)} points")
+                if points:
+                    per_slice_points[idx] = self._assign_instance_ids(points)
+                else:
+                    per_slice_points[idx] = []
+
+            return per_slice_points
+
+        except Exception as e:
+            print(f"  Molmo batch failed: {e}, falling back to sequential")
+            per_slice_points = {}
+            for i, idx in enumerate(indices):
+                try:
+                    points = self._generate_initial_points_molmo(images[i], organelle)
+                    per_slice_points[idx] = points
+                except Exception as e2:
+                    print(f"    Slice {idx} failed: {e2}")
+                    per_slice_points[idx] = []
+            return per_slice_points
+
+        finally:
+            # Clean up temp files
+            import shutil
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
     def _parse_initial_points(self, raw: str, em_image: Image.Image) -> list[dict]:
         """Extract point coordinates from the VLM's response."""
@@ -431,9 +531,8 @@ class EvaluatorAgent:
         import tempfile
         from pathlib import Path
 
-        description = f"{organelle.description} " if organelle.description else ""
         prompt = self.point_prompt or MOLMO_POINTS_PROMPT.format(
-            organelle=organelle.name, description=description
+            organelle=organelle.name
         )
 
         self.last_init_vlm_prompts = {
