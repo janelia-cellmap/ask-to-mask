@@ -19,6 +19,8 @@ install-torch-cu126 = "pip install torch torchvision --index-url https://downloa
 install-train-deps = "pip install -e '.[train]'"
 segment = "python -m ask_to_mask.cli"
 train = "python -m ask_to_mask.cli train"
+train-mito-2p5d = "python -m ask_to_mask.cli train-mito-2p5d"
+pretrain-mito-2p5d = "python -m ask_to_mask.cli pretrain-mito-2p5d"
 
 # Molmo environment: pinned transformers <5 for Molmo2-8B compatibility
 [feature.molmo.pypi-dependencies]

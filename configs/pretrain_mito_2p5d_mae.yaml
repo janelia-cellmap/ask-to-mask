@@ -1,0 +1,91 @@
+# Self-supervised masked-image-modeling (SimMIM-style) pretraining for the
+# 2.5D ConvNeXt encoder used by configs/train_mito_2p5d_fixed_fov.yaml.
+#
+# No labels needed at all -- samples raw EM crops across every scale in each
+# dataset's multiscale pyramid (not one fixed physical FOV), so the encoder
+# sees mitochondria-scale, nucleus-scale, and cell-scale structure in the same
+# run. Once this finishes, point the discriminative config's
+# `model.encoder_checkpoint` at `<output_dir>/<timestamp>/best/encoder.pt` (or
+# `final/encoder.pt`) to start the supervised curriculum from an EM-native
+# encoder instead of `pretrained: true` (ImageNet) or random init.
+
+model:
+  encoder: convnext_small
+  # Start from ImageNet weights, then continue pretraining on EM data --
+  # cheaper than random init and doesn't throw away generic edge/texture
+  # priors that do transfer across image domains.
+  pretrained: true
+  # Mask granularity in pixels; must match the encoder's total downsampling
+  # stride (32 for convnext_small/tiny/base) since the reconstruction head is
+  # a single 1x1 conv + PixelShuffle(32), à la SimMIM.
+  mask_patch_size: 32
+  mask_ratio: 0.6
+
+data:
+  data_root: /nrs/cellmap/data
+  em_path_template: "/nrs/cellmap/data/{dataset}/{dataset}.zarr/recon-1/em/fibsem-uint8"
+  include_datasets: null
+  skip_datasets: []
+
+  # 2.5D input: [z-4 ... z ... z+4]. Reconstruction target is the same 9-channel stack.
+  stack_depth: 9
+  z_offsets: null
+
+  # Crop is always this many pixels, but which pyramid scale it's read from is
+  # randomized per sample -- that randomization is what gives multi-scale
+  # coverage (mito-scale at fine scales, nucleus/cell-scale at coarser ones)
+  # without any per-organelle FOV tuning.
+  output_size: 512
+  # Filtered by physical resolution (nm/px), not pyramid index -- index depth
+  # varies per dataset (11 levels for aic_desmosome-1, 14 for
+  # jrc_mus-liver-zon-2), so an index cutoff isn't comparable across datasets.
+  # Finest available is typically 4-8nm/px (checked against real data).
+  # max_resolution_nm=512 already gives a 512px crop a ~262um span at the
+  # coarsest included scale -- several times a whole cell's diameter -- so
+  # going further out (pyramids here go up to 65536nm/px) is mostly blur with
+  # little biological structure left; not worth the training budget.
+  min_resolution_nm: null  # null = no lower bound, always include the finest scale
+  max_resolution_nm: 512.0
+
+  samples_per_epoch: 4096
+  val_holdout_fraction: 0.1
+  val_holdout_axis: x
+  val_holdout_position: high
+
+  augment: true
+  intensity_augment: true
+  auto_norms_percentile_low: 1.0
+  auto_norms_percentile_high: 99.0
+
+training:
+  batch_size: 16
+  gradient_accumulation_steps: 2
+  validation_batch_size: 16
+  # Match the CPU slots reserved in the bsub job (-n 12, one A100's
+  # proportional share of a 4-GPU/48-slot node).
+  num_workers: 10
+  prefetch_factor: 4
+  persistent_workers: true
+  pin_memory: true
+  learning_rate: 1.5e-4
+  weight_decay: 0.05
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  min_lr_ratio: 0.05
+  max_train_steps: 20000
+  mixed_precision: bf16
+  seed: 42
+  max_grad_norm: 1.0
+  compile: false
+
+  validation_steps: 1000
+  max_validation_batches: 16
+  num_validation_samples: 256
+  checkpointing_steps: 2000
+  log_steps: 20
+
+  output_dir: runs/mito-2p5d-pretrain-mae
+
+logging:
+  report_to: tensorboard
+  project: mito-2p5d-pretrain

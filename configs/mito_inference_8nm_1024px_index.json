@@ -1,0 +1,479 @@
+[
+  {
+    "dataset": "jrc_mus-liver-4",
+    "raw_base": "/nrs/cellmap/data/jrc_mus-liver-4/jrc_mus-liver-4.zarr/recon-1/em/fibsem-uint8",
+    "label_base": "/nrs/cellmap/data/jrc_mus-liver-4/jrc_mus-liver-4.zarr/recon-1/labels/inference/segmentations/mito",
+    "raw": {
+      "path": "/nrs/cellmap/data/jrc_mus-liver-4/jrc_mus-liver-4.zarr/recon-1/em/fibsem-uint8/s0",
+      "scale": "s0",
+      "resolution": [
+        8.0,
+        8.0,
+        8.0
+      ],
+      "offset": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "shape": [
+        5638,
+        8000,
+        12000
+      ]
+    },
+    "label": {
+      "path": "/nrs/cellmap/data/jrc_mus-liver-4/jrc_mus-liver-4.zarr/recon-1/labels/inference/segmentations/mito/s0",
+      "scale": "s0",
+      "resolution": [
+        8.0,
+        8.0,
+        8.0
+      ],
+      "offset": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "shape": [
+        5638,
+        8000,
+        12000
+      ]
+    },
+    "overlap_begin_nm": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "overlap_end_nm": [
+      45104.0,
+      64000.0,
+      96000.0
+    ]
+  },
+  {
+    "dataset": "jrc_mus-liver-5",
+    "raw_base": "/nrs/cellmap/data/jrc_mus-liver-5/jrc_mus-liver-5.zarr/recon-1/em/fibsem-uint8",
+    "label_base": "/nrs/cellmap/data/jrc_mus-liver-5/jrc_mus-liver-5.zarr/recon-1/labels/inference/segmentations/mito",
+    "raw": {
+      "path": "/nrs/cellmap/data/jrc_mus-liver-5/jrc_mus-liver-5.zarr/recon-1/em/fibsem-uint8/s0",
+      "scale": "s0",
+      "resolution": [
+        8.0,
+        8.0,
+        8.0
+      ],
+      "offset": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "shape": [
+        7896,
+        10200,
+        9112
+      ]
+    },
+    "label": {
+      "path": "/nrs/cellmap/data/jrc_mus-liver-5/jrc_mus-liver-5.zarr/recon-1/labels/inference/segmentations/mito/s0",
+      "scale": "s0",
+      "resolution": [
+        8.0,
+        8.0,
+        8.0
+      ],
+      "offset": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "shape": [
+        7896,
+        10195,
+        9110
+      ]
+    },
+    "overlap_begin_nm": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "overlap_end_nm": [
+      63168.0,
+      81560.0,
+      72880.0
+    ]
+  },
+  {
+    "dataset": "jrc_mus-liver-6",
+    "raw_base": "/nrs/cellmap/data/jrc_mus-liver-6/jrc_mus-liver-6.zarr/recon-1/em/fibsem-uint8",
+    "label_base": "/nrs/cellmap/data/jrc_mus-liver-6/jrc_mus-liver-6.zarr/recon-1/labels/inference/segmentations/mito",
+    "raw": {
+      "path": "/nrs/cellmap/data/jrc_mus-liver-6/jrc_mus-liver-6.zarr/recon-1/em/fibsem-uint8/s0",
+      "scale": "s0",
+      "resolution": [
+        8.0,
+        8.0,
+        8.0
+      ],
+      "offset": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "shape": [
+        8501,
+        8050,
+        8000
+      ]
+    },
+    "label": {
+      "path": "/nrs/cellmap/data/jrc_mus-liver-6/jrc_mus-liver-6.zarr/recon-1/labels/inference/segmentations/mito/s0",
+      "scale": "s0",
+      "resolution": [
+        8.0,
+        8.0,
+        8.0
+      ],
+      "offset": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "shape": [
+        8501,
+        8050,
+        8000
+      ]
+    },
+    "overlap_begin_nm": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "overlap_end_nm": [
+      68008.0,
+      64400.0,
+      64000.0
+    ]
+  },
+  {
+    "dataset": "jrc_mus-liver-7",
+    "raw_base": "/nrs/cellmap/data/jrc_mus-liver-7/jrc_mus-liver-7.zarr/recon-1/em/fibsem-uint8",
+    "label_base": "/nrs/cellmap/data/jrc_mus-liver-7/jrc_mus-liver-7.zarr/recon-1/labels/inference/segmentations/mito",
+    "raw": {
+      "path": "/nrs/cellmap/data/jrc_mus-liver-7/jrc_mus-liver-7.zarr/recon-1/em/fibsem-uint8/s0",
+      "scale": "s0",
+      "resolution": [
+        8.0,
+        8.0,
+        8.0
+      ],
+      "offset": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "shape": [
+        3629,
+        9650,
+        9700
+      ]
+    },
+    "label": {
+      "path": "/nrs/cellmap/data/jrc_mus-liver-7/jrc_mus-liver-7.zarr/recon-1/labels/inference/segmentations/mito/s0",
+      "scale": "s0",
+      "resolution": [
+        8.0,
+        8.0,
+        8.0
+      ],
+      "offset": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "shape": [
+        3629,
+        9650,
+        9700
+      ]
+    },
+    "overlap_begin_nm": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "overlap_end_nm": [
+      29032.0,
+      77200.0,
+      77600.0
+    ]
+  },
+  {
+    "dataset": "jrc_mus-liver-zon-1",
+    "raw_base": "/nrs/cellmap/data/jrc_mus-liver-zon-1/jrc_mus-liver-zon-1.zarr/recon-1/em/fibsem-uint8",
+    "label_base": "/nrs/cellmap/data/jrc_mus-liver-zon-1/jrc_mus-liver-zon-1.zarr/recon-1/labels/inference/segmentations/mito",
+    "raw": {
+      "path": "/nrs/cellmap/data/jrc_mus-liver-zon-1/jrc_mus-liver-zon-1.zarr/recon-1/em/fibsem-uint8/s0",
+      "scale": "s0",
+      "resolution": [
+        8.0,
+        8.0,
+        8.0
+      ],
+      "offset": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "shape": [
+        49645,
+        21451,
+        23601
+      ]
+    },
+    "label": {
+      "path": "/nrs/cellmap/data/jrc_mus-liver-zon-1/jrc_mus-liver-zon-1.zarr/recon-1/labels/inference/segmentations/mito/s0",
+      "scale": "s0",
+      "resolution": [
+        8.0,
+        8.0,
+        8.0
+      ],
+      "offset": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "shape": [
+        49644,
+        21450,
+        23600
+      ]
+    },
+    "overlap_begin_nm": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "overlap_end_nm": [
+      397152.0,
+      171600.0,
+      188800.0
+    ]
+  },
+  {
+    "dataset": "jrc_mus-liver-zon-2",
+    "raw_base": "/nrs/cellmap/data/jrc_mus-liver-zon-2/jrc_mus-liver-zon-2.zarr/recon-1/em/fibsem-uint8",
+    "label_base": "/nrs/cellmap/data/jrc_mus-liver-zon-2/jrc_mus-liver-zon-2.zarr/recon-1/labels/inference/segmentations/mito",
+    "raw": {
+      "path": "/nrs/cellmap/data/jrc_mus-liver-zon-2/jrc_mus-liver-zon-2.zarr/recon-1/em/fibsem-uint8/s0",
+      "scale": "s0",
+      "resolution": [
+        8.0,
+        8.0,
+        8.0
+      ],
+      "offset": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "shape": [
+        53336,
+        19466,
+        26250
+      ]
+    },
+    "label": {
+      "path": "/nrs/cellmap/data/jrc_mus-liver-zon-2/jrc_mus-liver-zon-2.zarr/recon-1/labels/inference/segmentations/mito/s0",
+      "scale": "s0",
+      "resolution": [
+        8.0,
+        8.0,
+        8.0
+      ],
+      "offset": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "shape": [
+        53336,
+        19466,
+        26250
+      ]
+    },
+    "overlap_begin_nm": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "overlap_end_nm": [
+      426688.0,
+      155728.0,
+      210000.0
+    ]
+  },
+  {
+    "dataset": "jrc_mus-salivary-1",
+    "raw_base": "/nrs/cellmap/data/jrc_mus-salivary-1/jrc_mus-salivary-1.zarr/recon-1/em/fibsem-uint8",
+    "label_base": "/nrs/cellmap/data/jrc_mus-salivary-1/jrc_mus-salivary-1.zarr/recon-1/labels/inference/segmentations/mito",
+    "raw": {
+      "path": "/nrs/cellmap/data/jrc_mus-salivary-1/jrc_mus-salivary-1.zarr/recon-1/em/fibsem-uint8/s0",
+      "scale": "s0",
+      "resolution": [
+        8.0,
+        8.0,
+        8.0
+      ],
+      "offset": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "shape": [
+        14886,
+        13866,
+        15392
+      ]
+    },
+    "label": {
+      "path": "/nrs/cellmap/data/jrc_mus-salivary-1/jrc_mus-salivary-1.zarr/recon-1/labels/inference/segmentations/mito/s0",
+      "scale": "s0",
+      "resolution": [
+        16.0,
+        16.0,
+        16.0
+      ],
+      "offset": [
+        4.0,
+        4.0,
+        4.0
+      ],
+      "shape": [
+        7443,
+        6933,
+        7696
+      ]
+    },
+    "overlap_begin_nm": [
+      4.0,
+      4.0,
+      4.0
+    ],
+    "overlap_end_nm": [
+      119088.0,
+      110928.0,
+      123136.0
+    ]
+  },
+  {
+    "dataset": "jrc_mus-salivary-2",
+    "raw_base": "/nrs/cellmap/data/jrc_mus-salivary-2/jrc_mus-salivary-2.zarr/recon-1/em/fibsem-uint8",
+    "label_base": "/nrs/cellmap/data/jrc_mus-salivary-2/jrc_mus-salivary-2.zarr/recon-1/labels/inference/segmentations/mito",
+    "raw": {
+      "path": "/nrs/cellmap/data/jrc_mus-salivary-2/jrc_mus-salivary-2.zarr/recon-1/em/fibsem-uint8/s0",
+      "scale": "s0",
+      "resolution": [
+        8.0,
+        8.0,
+        8.0
+      ],
+      "offset": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "shape": [
+        18460,
+        13901,
+        15561
+      ]
+    },
+    "label": {
+      "path": "/nrs/cellmap/data/jrc_mus-salivary-2/jrc_mus-salivary-2.zarr/recon-1/labels/inference/segmentations/mito/s0",
+      "scale": "s0",
+      "resolution": [
+        16.0,
+        16.0,
+        16.0
+      ],
+      "offset": [
+        4.0,
+        4.0,
+        4.0
+      ],
+      "shape": [
+        9230,
+        6950,
+        7780
+      ]
+    },
+    "overlap_begin_nm": [
+      4.0,
+      4.0,
+      4.0
+    ],
+    "overlap_end_nm": [
+      147680.0,
+      111204.0,
+      124484.0
+    ]
+  },
+  {
+    "dataset": "jrc_mus-salivary-3",
+    "raw_base": "/nrs/cellmap/data/jrc_mus-salivary-3/jrc_mus-salivary-3.zarr/recon-1/em/fibsem-uint8",
+    "label_base": "/nrs/cellmap/data/jrc_mus-salivary-3/jrc_mus-salivary-3.zarr/recon-1/labels/inference/segmentations/mito",
+    "raw": {
+      "path": "/nrs/cellmap/data/jrc_mus-salivary-3/jrc_mus-salivary-3.zarr/recon-1/em/fibsem-uint8/s0",
+      "scale": "s0",
+      "resolution": [
+        8.0,
+        8.0,
+        8.0
+      ],
+      "offset": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "shape": [
+        15334,
+        14218,
+        17405
+      ]
+    },
+    "label": {
+      "path": "/nrs/cellmap/data/jrc_mus-salivary-3/jrc_mus-salivary-3.zarr/recon-1/labels/inference/segmentations/mito/s0",
+      "scale": "s0",
+      "resolution": [
+        16.0,
+        16.0,
+        16.0
+      ],
+      "offset": [
+        4.0,
+        4.0,
+        4.0
+      ],
+      "shape": [
+        7667,
+        7109,
+        8702
+      ]
+    },
+    "overlap_begin_nm": [
+      4.0,
+      4.0,
+      4.0
+    ],
+    "overlap_end_nm": [
+      122672.0,
+      113744.0,
+      139236.0
+    ]
+  }
+]
