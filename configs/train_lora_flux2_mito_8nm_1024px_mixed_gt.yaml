@@ -1,0 +1,109 @@
+# Clean Flux2 LoRA run: mitochondria, pseudo coverage mixed with higher-weight true GT.
+
+model:
+  pretrained: "black-forest-labs/FLUX.2-dev"
+  lora:
+    rank: 64
+    alpha: 64
+    dropout: 0.0
+    target_modules: null
+
+data:
+  dataset_type: mixed_mito_gt_pseudo
+  data_root: /nrs/cellmap/data
+  em_path_template: "/nrs/cellmap/data/{dataset}/{dataset}.zarr/recon-1/em/fibsem-uint8"
+  segmentation_path_template: "/nrs/cellmap/data/{dataset}/{dataset}.zarr/recon-1/labels/inference/segmentations"
+  label_name: mito
+  index_path: configs/mito_inference_8nm_1024px_index.json
+  rebuild_index: false
+  include_datasets: null
+  skip_datasets: []
+
+  # 1024 px * 8 nm/px = 8192 nm physical FOV for pseudo-label crops.
+  fov_nm: 8192.0
+  raw_target_resolution_nm: 8.0
+  label_target_resolution_nm: 8.0
+  require_exact_resolution: false
+  raw_require_exact_resolution: true
+  label_require_exact_resolution: false
+  val_holdout_fraction: 0.1
+  val_holdout_axis: x
+  val_holdout_position: high
+
+  samples_per_epoch: 256
+  min_mask_fraction: 0.01
+  min_valid_fraction: 0.25
+  label_quality: pseudo
+  label_weight: 0.2
+  conservative_pseudo_targets: true
+  foreground_erosion_px: 2
+  boundary_band_px: 3
+  boundary_weight: 0.0
+  max_sample_attempts: 200
+  augment: false
+
+  auto_norms_percentile_low: 1.0
+  auto_norms_percentile_high: 99.0
+
+  prompt: "CLASS=mitochondria; OUTPUT=red_on_black"
+  preview_dir: runs/mito-8nm-1024px-mixed-gt-previews
+
+  gt:
+    data_root: /nrs/cellmap/data
+    norms_csv: configs/norms.csv
+    organelles:
+      - mito
+    fixed_fov: true
+    fov_nm: 8192.0
+    target_resolution_nm: 8.0
+    target_size: 1024
+    raw_require_exact_resolution: true
+    samples_per_epoch: 128
+    min_mask_fraction: 0.01
+    cache_dir: configs
+    target_mode: segmentation
+    include_resolution: false
+    auto_norms: true
+    auto_norms_percentile_low: 1.0
+    auto_norms_percentile_high: 99.0
+    sample_prob: 0.25
+    label_quality: gt
+    label_weight: 1.0
+    skip_datasets: []
+    validation_datasets:
+      - jrc_hela-3
+      - jrc_mus-liver-zon-2
+      - jrc_mus-salivary-3
+      - jrc_mus-pancreas-7
+      - jrc_zf-pancreas-1
+
+training:
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  num_workers: 2
+  prefetch_factor: 2
+  persistent_workers: true
+  pin_memory: true
+  learning_rate: 1.0e-4
+  lr_scheduler: cosine
+  lr_warmup_steps: 200
+  max_train_steps: 2000
+  mixed_precision: bf16
+  gradient_checkpointing: true
+  seed: 42
+  guidance_scale: 3.5
+
+  weighting_scheme: sigma_sqrt
+  flux2_conditioning: noise_endpoint
+  flux2_noise_mix: 0.0
+
+  validation_steps: 100
+  train_image_log_steps: 100
+  checkpointing_steps: 500
+  num_validation_images: 4
+
+  output_dir: runs/flux2-dev-lora-mito-8nm-1024px-mixed-gt
+  use_8bit_adam: true
+
+logging:
+  report_to: tensorboard

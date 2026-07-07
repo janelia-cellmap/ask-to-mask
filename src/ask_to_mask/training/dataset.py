@@ -16,6 +16,7 @@ from .zarr_utils import (
     CropInfo,
     compute_auto_norms,
     discover_crops,
+    find_scale_for_resolution,
     load_norms,
     normalize_raw,
 )
@@ -574,3 +575,397 @@ class CellMapFluxDataset(Dataset):
         if pil.size != (TARGET_SIZE, TARGET_SIZE):
             pil = pil.resize((TARGET_SIZE, TARGET_SIZE), Image.LANCZOS)
         return pil
+
+
+class FixedFovCellMapGtDataset(Dataset):
+    """Ground-truth mitochondria crops sampled at one fixed physical FOV."""
+
+    def __init__(
+        self,
+        data_root: str = "/nrs/cellmap/data",
+        norms_csv: str | None = None,
+        organelle_keys: list[str] | None = None,
+        samples_per_epoch: int = 2000,
+        min_mask_fraction: float = 0.01,
+        skip_datasets: list[str] | None = None,
+        include_datasets: list[str] | None = None,
+        cache_dir: str | None = None,
+        seed: int = 42,
+        augment: bool = True,
+        auto_norms: bool = False,
+        auto_norms_per_image: bool = False,
+        auto_norms_percentile_low: float = 1.0,
+        auto_norms_percentile_high: float = 99.0,
+        fov_nm: float = 8192.0,
+        target_resolution_nm: float = 8.0,
+        target_size: int | None = None,
+        raw_require_exact_resolution: bool = True,
+        label_weight: float = 1.0,
+        prompt: str = "CLASS=mitochondria; OUTPUT=red_on_black",
+        max_sample_attempts: int = 100,
+    ):
+        self.samples_per_epoch = int(samples_per_epoch)
+        self.min_mask_fraction = float(min_mask_fraction)
+        self.rng = np.random.default_rng(seed)
+        self.augment = bool(augment)
+        self.target_mode = "segmentation"
+        self.auto_norms_per_image = bool(auto_norms_per_image)
+        self.auto_norms_percentile_low = float(auto_norms_percentile_low)
+        self.auto_norms_percentile_high = float(auto_norms_percentile_high)
+        self.fov_nm = float(fov_nm)
+        self.target_resolution_nm = float(target_resolution_nm)
+        self.target_size = int(target_size or round(self.fov_nm / self.target_resolution_nm))
+        self.raw_require_exact_resolution = bool(raw_require_exact_resolution)
+        self.label_weight = float(label_weight)
+        self.prompt = prompt
+        self.max_sample_attempts = int(max_sample_attempts)
+        self._zarr_cache: dict[str, object] = {}
+
+        expected_fov = self.target_size * self.target_resolution_nm
+        if not np.isclose(expected_fov, self.fov_nm, atol=1e-3):
+            raise ValueError(
+                f"fov_nm={self.fov_nm} must equal target_size * target_resolution_nm "
+                f"({self.target_size} * {self.target_resolution_nm} = {expected_fov})"
+            )
+
+        if organelle_keys is None:
+            organelle_keys = ["mito"]
+        organelle_keys = [k for k in organelle_keys if ORGANELLE_FINE_CLASSES.get(k)]
+        if organelle_keys != ["mito"]:
+            raise ValueError("Fixed-FOV GT training is currently mitochondria-only")
+        self.fine_classes = ORGANELLE_FINE_CLASSES["mito"]
+        self.organelle = ORGANELLES["mito"]
+
+        norms = load_norms(norms_csv) if norms_csv is not None else {}
+        crops = discover_crops(
+            data_root=data_root,
+            target_classes=sorted(self.fine_classes),
+            norms=norms,
+            skip_datasets=skip_datasets,
+            include_datasets=include_datasets,
+            cache_dir=cache_dir,
+        )
+        if not crops:
+            raise RuntimeError(f"No GT crops found in {data_root}")
+
+        self.crops = self._filter_crops(crops)
+        if not self.crops:
+            raise RuntimeError(
+                "No GT crops remain after fixed-FOV filtering. "
+                f"Need raw YX resolution {self.target_resolution_nm} nm and "
+                f"YX extent >= {self.fov_nm} nm."
+            )
+
+        if auto_norms:
+            logger.info(
+                f"Computing fixed-FOV GT auto norms (p{auto_norms_percentile_low}"
+                f"-p{auto_norms_percentile_high})..."
+            )
+            auto = compute_auto_norms(
+                self.crops,
+                percentile_low=auto_norms_percentile_low,
+                percentile_high=auto_norms_percentile_high,
+            )
+            for crop in self.crops:
+                if crop.dataset_name in auto:
+                    crop.norm_params = auto[crop.dataset_name]
+
+        logger.info(
+            "FixedFovCellMapGtDataset: %s crops, target=%spx, resolution=%s nm/px, "
+            "FOV=%s nm, datasets=%s",
+            len(self.crops),
+            self.target_size,
+            self.target_resolution_nm,
+            self.fov_nm,
+            sorted({c.dataset_name for c in self.crops}),
+        )
+
+    def __len__(self) -> int:
+        return self.samples_per_epoch
+
+    def __getitem__(self, idx: int):
+        for _ in range(self.max_sample_attempts):
+            result = self._try_sample()
+            if result is not None:
+                return result
+        result = self._try_sample(skip_mask_filter=True)
+        if result is None:
+            raise RuntimeError("Could not sample a valid fixed-FOV GT crop")
+        return result
+
+    def _filter_crops(self, crops: list[CropInfo]) -> list[CropInfo]:
+        filtered = []
+        for crop in crops:
+            scale_info = find_scale_for_resolution(
+                crop.raw_zarr_path,
+                self.target_resolution_nm,
+                max_ratio=1.01 if self.raw_require_exact_resolution else 2.0,
+            )
+            if scale_info is None:
+                continue
+            raw_scale_path, raw_res, raw_off, raw_shape = scale_info
+            crop.raw_scale_path = raw_scale_path
+            crop.raw_resolution = raw_res
+            crop.raw_offset_world = raw_off
+            crop.raw_shape = raw_shape
+
+            raw_res = np.array(crop.raw_resolution, dtype=float)
+            crop_extent = np.array(crop.crop_extent_world, dtype=float)
+            if self.raw_require_exact_resolution and not np.allclose(
+                raw_res[1:], self.target_resolution_nm, atol=1e-3
+            ):
+                continue
+            if crop_extent[0] < raw_res[0]:
+                continue
+            if not any(cls_name in crop.class_info for cls_name in self.fine_classes):
+                continue
+            filtered.append(crop)
+        return filtered
+
+    def _open_zarr(self, path: str):
+        arr = self._zarr_cache.get(path)
+        if arr is None:
+            arr = zarr.open(path, mode="r")
+            self._zarr_cache[path] = arr
+        return arr
+
+    def _sample_window(self, crop: CropInfo) -> tuple[float, float, float] | None:
+        raw_res = np.array(crop.raw_resolution, dtype=float)
+        raw_off = np.array(crop.raw_offset_world, dtype=float)
+        raw_shape = np.array(crop.raw_shape, dtype=float)
+        crop_origin = np.array(crop.crop_origin_world, dtype=float)
+        crop_extent = np.array(crop.crop_extent_world, dtype=float)
+
+        z_max = crop_origin[0] + crop_extent[0] - raw_res[0]
+        if z_max < crop_origin[0]:
+            return None
+        z_world = float(self.rng.uniform(crop_origin[0], z_max + 1e-6))
+
+        y_min = raw_off[1]
+        x_min = raw_off[2]
+        y_max = raw_off[1] + raw_shape[1] * raw_res[1] - self.fov_nm
+        x_max = raw_off[2] + raw_shape[2] * raw_res[2] - self.fov_nm
+        if y_max < y_min or x_max < x_min:
+            return None
+        crop_y0 = np.clip(crop_origin[1], y_min, y_max)
+        crop_x0 = np.clip(crop_origin[2], x_min, x_max)
+        crop_y1 = np.clip(crop_origin[1] + max(0.0, crop_extent[1] - self.fov_nm), y_min, y_max)
+        crop_x1 = np.clip(crop_origin[2] + max(0.0, crop_extent[2] - self.fov_nm), x_min, x_max)
+        y_world = float(self.rng.uniform(min(crop_y0, crop_y1), max(crop_y0, crop_y1) + 1e-6))
+        x_world = float(self.rng.uniform(min(crop_x0, crop_x1), max(crop_x0, crop_x1) + 1e-6))
+        return z_world, y_world, x_world
+
+    def _try_sample(self, skip_mask_filter: bool = False):
+        crop = self.crops[self.rng.integers(len(self.crops))]
+        window = self._sample_window_near_foreground(crop)
+        if window is None:
+            window = self._sample_window(crop)
+        if window is None:
+            return None
+        z_world, y_world, x_world = window
+
+        raw_slice = self._read_raw_window(crop, z_world, y_world, x_world)
+        if raw_slice is None:
+            return None
+        label_result = self._read_label_window(crop, z_world, y_world, x_world)
+        if label_result is None:
+            return None
+        mask, valid_loss_mask = label_result
+        valid_pixels = max(1, int((valid_loss_mask > 0).sum()))
+        mask_fraction = float(mask.sum()) / float(valid_pixels)
+        if not skip_mask_filter and mask_fraction < self.min_mask_fraction:
+            return None
+
+        raw_uint8 = (raw_slice * 255).clip(0, 255).astype(np.uint8)
+        raw_rgb = np.stack([raw_uint8] * 3, axis=-1)
+        target_rgb = np.zeros_like(raw_rgb)
+        target_rgb[mask > 0] = np.array(self.organelle.rgb, dtype=np.uint8)
+
+        if self.augment:
+            raw_rgb, target_rgb = CellMapFluxDataset._augment(self, raw_rgb, target_rgb)
+
+        cond_pil = Image.fromarray(raw_rgb).resize(
+            (self.target_size, self.target_size), Image.LANCZOS
+        )
+        target_pil = Image.fromarray(target_rgb).resize(
+            (self.target_size, self.target_size), Image.NEAREST
+        )
+        valid_mask = Image.fromarray(valid_loss_mask)
+        return cond_pil, target_pil, self.prompt, valid_mask, self.label_weight
+
+    def _sample_window_near_foreground(
+        self,
+        crop: CropInfo,
+        max_tries: int = 25,
+    ) -> tuple[float, float, float] | None:
+        raw_res = np.array(crop.raw_resolution, dtype=float)
+        raw_off = np.array(crop.raw_offset_world, dtype=float)
+        raw_shape = np.array(crop.raw_shape, dtype=float)
+        y_min = raw_off[1]
+        x_min = raw_off[2]
+        y_max = raw_off[1] + raw_shape[1] * raw_res[1] - self.fov_nm
+        x_max = raw_off[2] + raw_shape[2] * raw_res[2] - self.fov_nm
+        if y_max < y_min or x_max < x_min:
+            return None
+
+        class_names = [c for c in self.fine_classes if c in crop.class_info]
+        if not class_names:
+            return None
+
+        for _ in range(max_tries):
+            cls_name = class_names[self.rng.integers(len(class_names))]
+            ci = crop.class_info[cls_name]
+            try:
+                label_arr = self._open_zarr(os.path.join(ci.zarr_path, ci.scale_path))
+            except Exception:
+                continue
+
+            label_res = np.array(ci.resolution, dtype=float)
+            label_off = np.array(ci.offset_world, dtype=float)
+            label_shape = np.array(ci.shape, dtype=int)
+            z_vox = int(self.rng.integers(max(1, label_shape[0])))
+            label_2d = np.array(label_arr[z_vox])
+            ys, xs = np.nonzero((label_2d > 0) & (label_2d != 255))
+            if len(ys) == 0:
+                continue
+
+            pick = int(self.rng.integers(len(ys)))
+            fg_y_world = label_off[1] + float(ys[pick]) * label_res[1]
+            fg_x_world = label_off[2] + float(xs[pick]) * label_res[2]
+            y_world = fg_y_world - float(self.rng.uniform(0, self.fov_nm))
+            x_world = fg_x_world - float(self.rng.uniform(0, self.fov_nm))
+            y_world = float(np.clip(y_world, y_min, y_max))
+            x_world = float(np.clip(x_world, x_min, x_max))
+            z_world = label_off[0] + float(z_vox) * label_res[0]
+            return z_world, y_world, x_world
+
+        return None
+
+    def _read_raw_window(
+        self,
+        crop: CropInfo,
+        z_world: float,
+        y_world: float,
+        x_world: float,
+    ) -> np.ndarray | None:
+        try:
+            raw_arr = self._open_zarr(os.path.join(crop.raw_zarr_path, crop.raw_scale_path))
+        except Exception:
+            return None
+
+        raw_res = np.array(crop.raw_resolution, dtype=float)
+        raw_off = np.array(crop.raw_offset_world, dtype=float)
+        raw_shape = np.array(crop.raw_shape, dtype=int)
+        y_size = int(round(self.fov_nm / raw_res[1]))
+        x_size = int(round(self.fov_nm / raw_res[2]))
+        if y_size <= 0 or x_size <= 0:
+            return None
+
+        z_vox = int(round((z_world - raw_off[0]) / raw_res[0]))
+        y_start = int(round((y_world - raw_off[1]) / raw_res[1]))
+        x_start = int(round((x_world - raw_off[2]) / raw_res[2]))
+        z_vox = max(0, min(z_vox, raw_shape[0] - 1))
+        y_start = max(0, min(y_start, raw_shape[1] - y_size))
+        x_start = max(0, min(x_start, raw_shape[2] - x_size))
+        y_end = y_start + y_size
+        x_end = x_start + x_size
+        if y_end > raw_shape[1] or x_end > raw_shape[2]:
+            return None
+
+        raw_2d = np.array(raw_arr[z_vox, y_start:y_end, x_start:x_end])
+        if raw_2d.shape != (y_size, x_size):
+            return None
+        if self.auto_norms_per_image:
+            from .zarr_utils import NormParams
+
+            p_low = float(np.percentile(raw_2d, self.auto_norms_percentile_low))
+            p_high = float(np.percentile(raw_2d, self.auto_norms_percentile_high))
+            return normalize_raw(raw_2d, NormParams(p_low, p_high, False))
+        return normalize_raw(raw_2d, crop.norm_params)
+
+    def _read_label_window(
+        self,
+        crop: CropInfo,
+        z_world: float,
+        y_world: float,
+        x_world: float,
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        mask = np.zeros((self.target_size, self.target_size), dtype=np.uint8)
+        valid_loss_mask = np.zeros((self.target_size, self.target_size), dtype=np.uint8)
+        request_y0 = float(y_world)
+        request_x0 = float(x_world)
+        request_y1 = request_y0 + self.fov_nm
+        request_x1 = request_x0 + self.fov_nm
+
+        for cls_name in self.fine_classes:
+            ci = crop.class_info.get(cls_name)
+            if ci is None:
+                continue
+            try:
+                label_arr = self._open_zarr(os.path.join(ci.zarr_path, ci.scale_path))
+            except Exception:
+                continue
+
+            label_res = np.array(ci.resolution, dtype=float)
+            label_off = np.array(ci.offset_world, dtype=float)
+            label_shape = np.array(ci.shape, dtype=int)
+
+            label_z0 = label_off[0]
+            label_z1 = label_off[0] + label_shape[0] * label_res[0]
+            if z_world < label_z0 or z_world >= label_z1:
+                continue
+
+            z_vox = int(round((z_world - label_off[0]) / label_res[0]))
+            z_vox = max(0, min(z_vox, label_shape[0] - 1))
+
+            label_y0 = label_off[1]
+            label_x0 = label_off[2]
+            label_y1 = label_off[1] + label_shape[1] * label_res[1]
+            label_x1 = label_off[2] + label_shape[2] * label_res[2]
+            intersect_y0 = max(request_y0, label_y0)
+            intersect_x0 = max(request_x0, label_x0)
+            intersect_y1 = min(request_y1, label_y1)
+            intersect_x1 = min(request_x1, label_x1)
+            if intersect_y1 <= intersect_y0 or intersect_x1 <= intersect_x0:
+                continue
+
+            y_start = int(np.floor((intersect_y0 - label_off[1]) / label_res[1]))
+            x_start = int(np.floor((intersect_x0 - label_off[2]) / label_res[2]))
+            y_end = int(np.ceil((intersect_y1 - label_off[1]) / label_res[1]))
+            x_end = int(np.ceil((intersect_x1 - label_off[2]) / label_res[2]))
+            y_start = max(0, min(y_start, label_shape[1]))
+            x_start = max(0, min(x_start, label_shape[2]))
+            y_end = max(y_start, min(y_end, label_shape[1]))
+            x_end = max(x_start, min(x_end, label_shape[2]))
+            if y_end <= y_start or x_end <= x_start:
+                continue
+
+            out_y0 = int(round((intersect_y0 - request_y0) / self.target_resolution_nm))
+            out_x0 = int(round((intersect_x0 - request_x0) / self.target_resolution_nm))
+            out_y1 = int(round((intersect_y1 - request_y0) / self.target_resolution_nm))
+            out_x1 = int(round((intersect_x1 - request_x0) / self.target_resolution_nm))
+            out_y0 = max(0, min(out_y0, self.target_size))
+            out_x0 = max(0, min(out_x0, self.target_size))
+            out_y1 = max(out_y0, min(out_y1, self.target_size))
+            out_x1 = max(out_x0, min(out_x1, self.target_size))
+            out_h = out_y1 - out_y0
+            out_w = out_x1 - out_x0
+            if out_h <= 0 or out_w <= 0:
+                continue
+
+            label_2d = np.array(label_arr[z_vox, y_start:y_end, x_start:x_end])
+            binary = ((label_2d > 0) & (label_2d != 255)).astype(np.uint8)
+            if binary.shape != (out_h, out_w):
+                zoom_y = out_h / binary.shape[0]
+                zoom_x = out_w / binary.shape[1]
+                binary = ndimage_zoom(binary, (zoom_y, zoom_x), order=0)
+                binary = binary[:out_h, :out_w]
+            mask[out_y0:out_y1, out_x0:out_x1] = np.maximum(
+                mask[out_y0:out_y1, out_x0:out_x1],
+                binary.astype(np.uint8),
+            )
+            valid_loss_mask[out_y0:out_y1, out_x0:out_x1] = 255
+
+        if mask.sum() == 0 or valid_loss_mask.sum() == 0:
+            return None
+        return mask, valid_loss_mask
