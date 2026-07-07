@@ -1,0 +1,160 @@
+# Supervised 2.5D EM -> mitochondria mask training.
+# Goal: check whether a dedicated model trained on GT (+ existing UNet pseudo-labels
+# for scale/generality) can beat the existing UNet inference pipeline's own
+# segmentations, measured against real GT. `data.comparison_masks` (defaults to
+# reusing `segmentation_path_template` below) attaches the UNet's own output to
+# GT validation crops so `val/gt/comparison/unet/*` gives that baseline directly.
+
+model:
+  architecture: convnext_unet
+  encoder: convnext_small
+  pretrained: false
+  # Once configs/pretrain_mito_2p5d_mae.yaml has produced a checkpoint, prefer
+  # loading that EM-native encoder over `pretrained: true` (ImageNet) or
+  # random init -- uncomment and point at e.g.
+  # runs/mito-2p5d-pretrain-mae/<timestamp>/best/encoder.pt
+  # encoder_checkpoint: null
+  decoder_channels: 256
+  dropout: 0.05
+  # channel 0: mito mask logits, channel 1: boundary logits, channel 2: signed-distance logits
+  output_channels: 3
+
+data:
+  dataset_type: mixed_mito_gt_pseudo
+  data_root: /nrs/cellmap/data
+  em_path_template: "/nrs/cellmap/data/{dataset}/{dataset}.zarr/recon-1/em/fibsem-uint8"
+  segmentation_path_template: "/nrs/cellmap/data/{dataset}/{dataset}.zarr/recon-1/labels/inference/segmentations"
+  label_name: mito
+  index_path: configs/mito_inference_8nm_1024px_index.json
+  rebuild_index: false
+  include_datasets: null
+  skip_datasets: []
+
+  # 1024 px * 8 nm/px = 8192 nm physical FOV.
+  fov_nm: 8192.0
+  output_size: 1024
+  raw_target_resolution_nm: 8.0
+  label_target_resolution_nm: 8.0
+  require_exact_resolution: false
+  raw_require_exact_resolution: true
+  label_require_exact_resolution: false
+  val_holdout_fraction: 0.1
+  val_holdout_axis: x
+  val_holdout_position: high
+
+  # 2.5D input: [z-4 ... z ... z+4], center slice target only.
+  stack_depth: 9
+  z_offsets: null
+
+  samples_per_epoch: 256
+  min_mask_fraction: 0.01
+  min_valid_fraction: 0.25
+  label_quality: pseudo
+  label_weight: 0.2
+  conservative_pseudo_targets: true
+  foreground_erosion_px: 2
+  boundary_band_px: 3
+  boundary_weight: 0.0
+  max_sample_attempts: 200
+  augment: true
+  intensity_augment: true
+
+  auto_norms_percentile_low: 1.0
+  auto_norms_percentile_high: 99.0
+
+  gt:
+    data_root: /nrs/cellmap/data
+    norms_csv: configs/norms.csv
+    organelles:
+      - mito
+    fov_nm: 8192.0
+    target_resolution_nm: 8.0
+    target_size: 1024
+    raw_require_exact_resolution: true
+    samples_per_epoch: 128
+    min_mask_fraction: 0.01
+    cache_dir: configs
+    auto_norms: true
+    auto_norms_per_image: false
+    auto_norms_percentile_low: 1.0
+    auto_norms_percentile_high: 99.0
+    augment: true
+    intensity_augment: true
+    # Stage-1 (pseudo-heavy) GT sampling probability; training.curriculum
+    # overrides this with stage2_gt_sample_prob after stage1_steps.
+    sample_prob: 0.35
+    label_weight: 1.0
+    skip_datasets: []
+    validation_datasets:
+      - jrc_hela-3
+      - jrc_mus-liver-zon-2
+      - jrc_mus-salivary-3
+      - jrc_mus-pancreas-7
+      - jrc_zf-pancreas-1
+
+loss:
+  bce_weight: 1.0
+  focal_weight: 0.0
+  dice_weight: 0.7
+  tversky_weight: 0.3
+  tversky_alpha: 0.3
+  tversky_beta: 0.7
+  boundary_weight: 0.2
+  boundary_radius_px: 2
+  distance_weight: 0.05
+  distance_max_px: 32.0
+  distance_beta: 0.1
+  pos_weight: null
+
+metrics:
+  threshold: 0.5
+  boundary_radius_px: 2
+  boundary_tolerance_px: 2
+  object_match_iou: 0.1
+
+training:
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  validation_batch_size: 1
+  # Match the CPU slots reserved in the bsub job (-n 12, one A100's
+  # proportional share of a 4-GPU/48-slot node): 10 workers + main process +
+  # slack, so CPU-side zarr reads/resize/augment can actually keep pace with
+  # a fast A100 instead of leaving it idle waiting on data.
+  num_workers: 10
+  prefetch_factor: 4
+  persistent_workers: true
+  pin_memory: true
+  learning_rate: 2.0e-4
+  weight_decay: 0.05
+  lr_scheduler: cosine
+  lr_warmup_steps: 200
+  min_lr_ratio: 0.05
+  max_train_steps: 5000
+  mixed_precision: bf16
+  seed: 42
+  max_grad_norm: 1.0
+  compile: false
+
+  validation_steps: 250
+  max_validation_batches: 8
+  train_image_log_steps: 250
+  checkpointing_steps: 1000
+  num_train_images: 2
+  num_validation_images: 4
+
+  # Two-stage curriculum: pseudo-heavy first to learn general mitochondria
+  # shape/scale from plentiful (but UNet-derived, imperfect) labels, then
+  # GT-dominant to correct the model toward true boundaries on the scarce
+  # ground truth. A flat mix for the whole run risks the model mostly
+  # learning to reproduce the existing UNet pipeline's own errors.
+  curriculum:
+    enabled: true
+    stage1_steps: 3500
+    stage2_gt_sample_prob: 0.8
+
+  output_dir: runs/mito-2p5d-fixed-fov
+
+logging:
+  report_to: tensorboard
+  project: mito-2p5d
+  log_steps: 10

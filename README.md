@@ -432,11 +432,29 @@ Each preview shows a side-by-side comparison: auto-stretched (full range) vs. th
 
 Requires A100 80GB or equivalent. Uses gradient checkpointing and 8-bit Adam to fit in memory.
 
+## 2.5D discriminative mitochondria model
+
+A separate, non-generative track: a supervised ConvNeXt-UNet trained on a 9-slice EM z-stack to directly predict the center-slice mitochondria mask (no prompts, no image generation), evaluated against the existing UNet inference pipeline's own segmentations. See `docs/mito_2p5d_training_handoff.md` for the full design writeup.
+
+```bash
+# Optional: self-supervised masked-image-modeling pretraining on raw, unlabeled
+# EM data (no GT needed) before the supervised fine-tune below.
+pixi run pretrain-mito-2p5d --config configs/pretrain_mito_2p5d_mae.yaml
+
+# Supervised training: mixed pseudo-label + GT curriculum
+pixi run train-mito-2p5d --config configs/train_mito_2p5d_fixed_fov.yaml
+
+# GT-only control run (no pseudo-labels, no curriculum)
+pixi run train-mito-2p5d --config configs/train_mito_2p5d_gt_only.yaml
+```
+
+Resume either with `--resume <output_dir>/<timestamp>/checkpoint-<step>`.
+
 ## Project structure
 
 ```
 src/ask_to_mask/
-  cli.py           # CLI entry point (segment, list-organelles, train)
+  cli.py           # CLI entry point (segment, list-organelles, train, train-mito-2p5d, pretrain-mito-2p5d)
   config.py        # Organelle class definitions and model registry
   model.py         # Flux model loading and inference (with LoRA support)
   pipeline.py      # Orchestrates load → prompt → infer → postprocess
@@ -452,12 +470,24 @@ src/ask_to_mask/
     zstack.py           # Z-stack orchestrator: multi-slice refinement, orthogonal plane majority vote
     schemas.py          # Dataclasses for structured data exchange
   training/
-    dataset.py     # CellMapFluxDataset: zarr-backed training data
-    zarr_utils.py  # Zarr reading utilities (adapted from sam3m)
-    train.py       # LoRA training loop with accelerate + PEFT
+    dataset.py                    # CellMapFluxDataset: zarr-backed training data
+    zarr_utils.py                 # Zarr reading utilities (adapted from sam3m)
+    train.py                      # LoRA training loop with accelerate + PEFT
+    inference_mito_dataset.py     # Fixed-FOV pseudo-label dataset backed by UNet inference segmentations
+    mito_2p5d_dataset.py          # 2.5D supervised datasets: pseudo/GT/mixed, comparison-mask baseline
+    mito_2p5d_model.py            # ConvNeXt-UNet (discriminative) + ConvNeXtMaskedAutoencoder (self-supervised)
+    mito_2p5d_losses.py           # Composite BCE/Dice/Tversky/boundary/SDF loss
+    mito_2p5d_metrics.py          # Pixel/boundary/object metrics + baseline comparison
+    mito_2p5d_pretrain_dataset.py # Label-free multi-scale EM dataset for masked-image-modeling
+    train_mito_2p5d.py            # Supervised 2.5D trainer (pseudo/GT curriculum)
+    train_mito_2p5d_pretrain.py   # Self-supervised masked-image-modeling pretrainer
+    prefetch.py                   # CUDA-stream batch prefetcher
+    worker_seeding.py             # DataLoader worker_init_fn for per-worker RNG diversity
 scripts/
-  molmo_points.py       # Standalone Molmo2 inference script (runs in molmo pixi env)
-  preview_crop_norms.py # Preview and auto-compute intensity normalization per dataset
+  molmo_points.py             # Standalone Molmo2 inference script (runs in molmo pixi env)
+  preview_crop_norms.py       # Preview and auto-compute intensity normalization per dataset
+  train_mito_2p5d.py          # Script entry point for supervised 2.5D training
+  train_mito_2p5d_pretrain.py # Script entry point for self-supervised pretraining
 configs/
   refine_ortho_example.yaml                    # Example config for orthogonal plane refinement
   refine_zarr_example.yaml                     # Example config for z-stack zarr refinement
@@ -465,5 +495,8 @@ configs/
   train_lora_flux2.yaml            # Flux2-dev training configuration
   train_lora_flux2_r64_autonorm.yaml           # Flux2-dev with auto-norms, rank 64
   train_lora_flux2_r64_autonorm_augmented.yaml # Flux2-dev with auto-norms + all augmentations
+  train_mito_2p5d_fixed_fov.yaml    # Supervised 2.5D: mixed pseudo+GT, curriculum
+  train_mito_2p5d_gt_only.yaml      # Supervised 2.5D: GT-only control run
+  pretrain_mito_2p5d_mae.yaml       # Self-supervised masked-image-modeling pretraining
   norms.csv                                    # Per-dataset intensity normalization (manual)
 ```

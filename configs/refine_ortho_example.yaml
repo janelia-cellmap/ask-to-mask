@@ -1,0 +1,77 @@
+# Orthogonal plane processing: run segmentation on XY, XZ, and YZ planes,
+# then merge via majority vote (voxel is foreground if >= 2 planes agree).
+#
+# Usage: pixi run segment refine --config configs/refine_ortho_example.yaml
+#
+# This loads a roughly isotropic chunk from the zarr volume and processes
+# ~10 slices per orthogonal plane. Results are saved as PNGs per plane
+# and as a merged 3D zarr with OME-NGFF metadata for neuroglancer.
+
+# ── Input ──────────────────────────────────────────────────────────────
+zarr_path: /nrs/cellmap/data/jrc_mus-liver/jrc_mus-liver.zarr/recon-1/em/fibsem-uint8/s0
+
+# Isotropic ROI in world coordinates (nm): 4000nm cube → 500x500x500 voxels at 8nm/px
+roi: "[4000:8000, 4000:8000, 4000:8000]"
+
+# Subsample slices within each plane. At 8nm/voxel, 500 voxels per axis.
+# z_step_nm=400 → every 50th voxel → ~10 slices per plane.
+z_step_nm: 400
+
+# ── Output ─────────────────────────────────────────────────────────────
+output_dir: ./outputs/ortho/
+# Zarr output with OME-NGFF metadata (voxel_size + offset from input).
+# Open in neuroglancer alongside the source EM volume.
+save_zarr: ./outputs/ortho/masks.zarr
+
+# ── Organelle ──────────────────────────────────────────────────────────
+organelle: mito
+
+# ── Orthogonal mode ────────────────────────────────────────────────────
+# Process all 3 planes (XY, XZ, YZ). Each plane gets ~10 slices
+# (controlled by z_step_nm above). Masks are merged via majority vote.
+ortho: true
+
+# Run Molmo point detection for all 3 planes in parallel.
+# Spawns 3 Molmo instances simultaneously (~60 GB VRAM total).
+# Disable on smaller GPUs.
+parallel_points: true
+
+# ── Generation backend ─────────────────────────────────────────────────
+gen_backend: sam3
+sam3_strategy: vlm-coordinate
+sam3_model: facebook/sam3
+sam3_confidence: 0.5
+
+# ── Point detection ────────────────────────────────────────────────────
+# Molmo detects organelle locations → feeds point coords to SAM3.
+# In batch mode (used automatically for multi-slice), the model loads
+# once and processes all images sequentially — much faster than per-slice.
+point_provider: huggingface
+point_model: allenai/Molmo2-8B
+point_prompt: "Point to the ovular, cylindrical, circular mitochondria organelles in this EM image"
+
+# point_sample: how many slices Molmo runs on per plane (default: all).
+# Set lower than total slices to speed up. Points from sampled slices
+# are interpolated to neighboring slices.
+# point_sample: 5
+
+# multi_slice_points: detect points per-slice before running SAM3.
+# Required for vlm-coordinate with z-stacks.
+multi_slice_points: true
+
+# ── Evaluation ─────────────────────────────────────────────────────────
+# VLM evaluator scores masks and suggests point refinements.
+# With skip_refinement=true, evaluation is skipped entirely — just
+# detect points + run SAM3 once per slice.
+llm_provider: ollama
+llm_model: qwen2.5vl:72b
+skip_refinement: true
+
+# If skip_refinement is false, these control the refinement loop:
+# max_iterations: 5   # max rounds of evaluate → refine points → re-run SAM3
+# min_score: 0.95     # stop early if eval VLM scores above this
+
+# ── Other ──────────────────────────────────────────────────────────────
+device: cuda
+resolution: 4.0       # nm/px — passed to VLM prompts for scale context
+instance: false        # true = instance-labeled masks (uint16), false = binary

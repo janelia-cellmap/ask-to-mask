@@ -12,6 +12,20 @@ runs/
 checkpoints/
 configs/*.pkl
 
+# Job logs and inference/demo outputs
+logs/
+refined/
+presentation/
+presentation_bundle.zip
+*.gif
+*.mp4
+
+# Ad-hoc scratch scripts and test outputs
+/test_molmo.py
+/molmo_points_result.png
+/ortho_grid.png
+/test_em_slice.png
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

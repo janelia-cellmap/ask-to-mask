@@ -1,0 +1,57 @@
+# Second-stage Flux2 LoRA run: mitochondria only, true GT crops, full authority.
+
+model:
+  pretrained: "black-forest-labs/FLUX.2-dev"
+  lora:
+    rank: 64
+    alpha: 64
+    dropout: 0.0
+    target_modules: null
+
+data:
+  dataset_type: groundtruth_crops
+  data_root: /nrs/cellmap/data
+  norms_csv: configs/norms.csv
+  organelles:
+    - mito
+  samples_per_epoch: 64
+  min_mask_fraction: 0.01
+  cache_dir: configs
+  skip_datasets: []
+  target_mode: segmentation
+  include_resolution: true
+  auto_norms: true
+  auto_norms_percentile_low: 1.0
+  auto_norms_percentile_high: 99.0
+
+  # True GT is implicit full weight in the trainer.
+  label_quality: gt
+  label_weight: 1.0
+
+training:
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  num_workers: 2
+  learning_rate: 5.0e-5
+  lr_scheduler: cosine
+  lr_warmup_steps: 50
+  max_train_steps: 1000
+  mixed_precision: bf16
+  gradient_checkpointing: true
+  seed: 42
+  guidance_scale: 3.5
+
+  weighting_scheme: sigma_sqrt
+  flux2_conditioning: noise_endpoint
+  flux2_noise_mix: 0.0
+
+  validation_steps: 100
+  train_image_log_steps: 100
+  checkpointing_steps: 250
+  num_validation_images: 4
+
+  output_dir: runs/flux2-dev-lora-mito-gt-finetune
+  use_8bit_adam: true
+
+logging:
+  report_to: tensorboard

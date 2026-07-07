@@ -28,6 +28,7 @@ train = [
     "peft>=0.7.0",
     "scipy",
     "tensorboard",
+    "wandb",
     "bitsandbytes",
 ]
 agents = [

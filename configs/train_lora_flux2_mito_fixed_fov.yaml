@@ -1,0 +1,82 @@
+# Clean Flux2 LoRA run: mitochondria only, fixed 1600 nm FOV, inference labels.
+
+model:
+  pretrained: "black-forest-labs/FLUX.2-dev"
+  lora:
+    rank: 64
+    alpha: 64
+    dropout: 0.0
+    target_modules: null
+
+data:
+  dataset_type: inference_mito_fixed_fov
+  data_root: /nrs/cellmap/data
+  em_path_template: "/nrs/cellmap/data/{dataset}/{dataset}.zarr/recon-1/em/fibsem-uint8"
+  segmentation_path_template: "/nrs/cellmap/data/{dataset}/{dataset}.zarr/recon-1/labels/inference/segmentations"
+  label_name: mito
+  index_path: configs/mito_inference_fixed_fov_index.json
+  rebuild_index: false
+  include_datasets: null
+  skip_datasets: []
+
+  # Fixed physical field of view sampled from raw/label overlap.
+  fov_nm: 1600.0
+  fov_tolerance_nm: 0.0
+
+  # null = finest multiscale level for each source.
+  raw_target_resolution_nm: null
+  label_target_resolution_nm: null
+
+  samples_per_epoch: 256
+  min_mask_fraction: 0.01
+  # Fraction of the 1600 nm crop covered by the segmentation volume.
+  # Loss is masked outside this valid area, but raw EM remains in the input.
+  min_valid_fraction: 0.25
+  label_quality: pseudo
+  label_weight: 0.2
+  conservative_pseudo_targets: true
+  foreground_erosion_px: 2
+  boundary_band_px: 3
+  boundary_weight: 0.0
+  max_sample_attempts: 200
+  augment: false
+
+  # Per-sample EM normalization before RGB conversion.
+  auto_norms_percentile_low: 1.0
+  auto_norms_percentile_high: 99.0
+
+  # One fixed prompt for every sample.
+  prompt: "CLASS=mitochondria; OUTPUT=red_on_black"
+
+  preview_dir: runs/mito-fixed-fov-previews
+
+training:
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  num_workers: 2
+  prefetch_factor: 2
+  persistent_workers: true
+  pin_memory: true
+  learning_rate: 1.0e-4
+  lr_scheduler: cosine
+  lr_warmup_steps: 200
+  max_train_steps: 2000
+  mixed_precision: bf16
+  gradient_checkpointing: true
+  seed: 42
+  guidance_scale: 3.5
+
+  weighting_scheme: sigma_sqrt
+  flux2_conditioning: noise_endpoint
+  flux2_noise_mix: 0.0
+
+  validation_steps: 100
+  train_image_log_steps: 100
+  checkpointing_steps: 500
+  num_validation_images: 4
+
+  output_dir: runs/flux2-dev-lora-mito-fixed-fov
+  use_8bit_adam: true
+
+logging:
+  report_to: tensorboard

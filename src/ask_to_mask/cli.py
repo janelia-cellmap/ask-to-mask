@@ -199,6 +199,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--resume", type=str, default=None, help="Resume from checkpoint directory."
     )
 
+    mito_train = sub.add_parser(
+        "train-mito-2p5d",
+        help="Train a supervised 2.5D EM -> mitochondria mask model.",
+    )
+    mito_train.add_argument(
+        "--config", type=Path, required=True, help="2.5D mitochondria training YAML."
+    )
+    mito_train.add_argument(
+        "--resume", type=str, default=None, help="Resume from checkpoint directory."
+    )
+
+    mito_pretrain = sub.add_parser(
+        "pretrain-mito-2p5d",
+        help="Self-supervised masked-image-modeling pretraining for the 2.5D ConvNeXt encoder.",
+    )
+    mito_pretrain.add_argument(
+        "--config", type=Path, required=True, help="2.5D pretraining YAML."
+    )
+    mito_pretrain.add_argument(
+        "--resume", type=str, default=None, help="Resume from checkpoint directory."
+    )
+
     preview_train = sub.add_parser(
         "preview-train",
         help="Export training raw/target preview pairs without training.",
@@ -957,6 +979,20 @@ def cmd_train(args: argparse.Namespace) -> None:
     train(config_path=str(args.config), resume_from=args.resume)
 
 
+def cmd_train_mito_2p5d(args: argparse.Namespace) -> None:
+    from .training.train_mito_2p5d import train
+
+    output_dir = train(config_path=str(args.config), resume_from=args.resume)
+    print(f"Supervised 2.5D mitochondria training output: {output_dir}")
+
+
+def cmd_pretrain_mito_2p5d(args: argparse.Namespace) -> None:
+    from .training.train_mito_2p5d_pretrain import train
+
+    output_dir = train(config_path=str(args.config), resume_from=args.resume)
+    print(f"Self-supervised 2.5D pretraining output: {output_dir}")
+
+
 def cmd_preview_train(args: argparse.Namespace) -> None:
     import yaml
 
@@ -992,6 +1028,10 @@ def main(argv: list[str] | None = None) -> None:
         cmd_refine(args)
     elif args.command == "train":
         cmd_train(args)
+    elif args.command == "train-mito-2p5d":
+        cmd_train_mito_2p5d(args)
+    elif args.command == "pretrain-mito-2p5d":
+        cmd_pretrain_mito_2p5d(args)
     elif args.command == "preview-train":
         cmd_preview_train(args)
 
