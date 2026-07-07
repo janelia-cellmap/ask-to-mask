@@ -651,6 +651,7 @@ def train(config_path: str, resume_from: str | None = None):
             foreground_erosion_px=data_cfg.get("foreground_erosion_px", 2),
             boundary_band_px=data_cfg.get("boundary_band_px", 3),
             boundary_weight=data_cfg.get("boundary_weight", 0.0),
+            background_weight=data_cfg.get("background_weight", 0.05),
             max_sample_attempts=data_cfg.get("max_sample_attempts", 100),
             prompt=data_cfg.get("prompt", "CLASS=mitochondria; OUTPUT=red_on_black"),
             auto_norms_percentile_low=data_cfg.get("auto_norms_percentile_low", 1.0),
@@ -707,6 +708,7 @@ def train(config_path: str, resume_from: str | None = None):
                     target_size=gt_cfg.get("target_size", 1024),
                     raw_require_exact_resolution=gt_cfg.get("raw_require_exact_resolution", True),
                     label_weight=gt_cfg.get("label_weight", 1.0),
+                    background_weight=gt_cfg.get("background_weight", data_cfg.get("background_weight", 0.05)),
                     prompt=prompt,
                     max_sample_attempts=gt_cfg.get("max_sample_attempts", data_cfg.get("max_sample_attempts", 100)),
                 )

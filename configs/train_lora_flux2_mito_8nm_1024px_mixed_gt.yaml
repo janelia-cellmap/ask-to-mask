@@ -39,6 +39,7 @@ data:
   foreground_erosion_px: 2
   boundary_band_px: 3
   boundary_weight: 0.0
+  background_weight: 0.05
   max_sample_attempts: 200
   augment: false
 
@@ -66,9 +67,10 @@ data:
     auto_norms: true
     auto_norms_percentile_low: 1.0
     auto_norms_percentile_high: 99.0
-    sample_prob: 0.25
+    sample_prob: 0.5
     label_quality: gt
     label_weight: 1.0
+    background_weight: 0.05
     skip_datasets: []
     validation_datasets:
       - jrc_hela-3

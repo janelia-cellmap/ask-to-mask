@@ -601,6 +601,7 @@ class FixedFovCellMapGtDataset(Dataset):
         target_size: int | None = None,
         raw_require_exact_resolution: bool = True,
         label_weight: float = 1.0,
+        background_weight: float = 0.05,
         prompt: str = "CLASS=mitochondria; OUTPUT=red_on_black",
         max_sample_attempts: int = 100,
     ):
@@ -617,6 +618,7 @@ class FixedFovCellMapGtDataset(Dataset):
         self.target_size = int(target_size or round(self.fov_nm / self.target_resolution_nm))
         self.raw_require_exact_resolution = bool(raw_require_exact_resolution)
         self.label_weight = float(label_weight)
+        self.background_weight = float(background_weight)
         self.prompt = prompt
         self.max_sample_attempts = int(max_sample_attempts)
         self._zarr_cache: dict[str, object] = {}
@@ -790,7 +792,11 @@ class FixedFovCellMapGtDataset(Dataset):
         target_pil = Image.fromarray(target_rgb).resize(
             (self.target_size, self.target_size), Image.NEAREST
         )
-        valid_mask = Image.fromarray(valid_loss_mask)
+        loss_weight = (valid_loss_mask > 0).astype(np.float32) * self.background_weight
+        loss_weight[mask > 0] = 1.0
+        valid_mask = Image.fromarray(
+            np.clip(loss_weight * 255.0, 0, 255).astype(np.uint8), mode="L"
+        )
         return cond_pil, target_pil, self.prompt, valid_mask, self.label_weight
 
     def _sample_window_near_foreground(

@@ -277,6 +277,7 @@ class InferenceMitoFixedFovDataset(Dataset):
         foreground_erosion_px: int = 2,
         boundary_band_px: int = 3,
         boundary_weight: float = 0.0,
+        background_weight: float = 0.05,
         max_sample_attempts: int = 100,
         output_size: int = TARGET_SIZE,
         prompt: str = FIXED_PROMPT,
@@ -300,6 +301,7 @@ class InferenceMitoFixedFovDataset(Dataset):
         self.foreground_erosion_px = int(foreground_erosion_px)
         self.boundary_band_px = int(boundary_band_px)
         self.boundary_weight = float(boundary_weight)
+        self.background_weight = float(background_weight)
         self.max_sample_attempts = max_sample_attempts
         self.output_size = output_size
         self.prompt = prompt
@@ -442,9 +444,10 @@ class InferenceMitoFixedFovDataset(Dataset):
             "foreground_erosion_px": self.foreground_erosion_px,
             "boundary_band_px": self.boundary_band_px,
             "boundary_weight": self.boundary_weight,
+            "background_weight": self.background_weight,
             "loss_mask": (
                 "valid where crop overlaps segmentation; pseudo foreground is eroded, "
-                "boundary is ignored/low-weight, far background is confident"
+                "boundary is ignored/low-weight, far background is downweighted"
             ),
             "prompt": self.prompt,
         }
@@ -581,7 +584,9 @@ class InferenceMitoFixedFovDataset(Dataset):
         self, mask: np.ndarray, valid: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray]:
         if not self.conservative_pseudo_targets or self.label_quality == "gt":
-            return mask, valid.astype(np.float32)
+            confidence = valid.astype(np.float32) * self.background_weight
+            confidence[mask & valid] = 1.0
+            return mask, confidence
 
         eroded = mask.copy()
         if self.foreground_erosion_px > 0:
@@ -595,7 +600,7 @@ class InferenceMitoFixedFovDataset(Dataset):
         boundary = valid & ~(confident_background | confident_foreground)
 
         confidence = np.zeros(mask.shape, dtype=np.float32)
-        confidence[confident_background] = 1.0
+        confidence[confident_background] = self.background_weight
         confidence[confident_foreground] = 1.0
         if self.boundary_weight > 0:
             confidence[boundary] = self.boundary_weight
@@ -678,6 +683,7 @@ def dataset_from_training_config(config: dict) -> InferenceMitoFixedFovDataset:
         foreground_erosion_px=data_cfg.get("foreground_erosion_px", 2),
         boundary_band_px=data_cfg.get("boundary_band_px", 3),
         boundary_weight=data_cfg.get("boundary_weight", 0.0),
+        background_weight=data_cfg.get("background_weight", 0.05),
         max_sample_attempts=data_cfg.get("max_sample_attempts", 100),
         prompt=data_cfg.get("prompt", FIXED_PROMPT),
         seed=train_cfg.get("seed", 42),
