@@ -170,7 +170,7 @@ Iteratively improve mask quality using a VLM evaluator agent. Each iteration gen
 ### Setup
 
 ```bash
-# Install agent dependencies (Gemini evaluator backend, default)
+# Install agent dependencies (Gemini/Antigravity evaluator backend, default)
 pip install -e '.[agents-google]'
 
 # Or install ollama backend instead
@@ -227,7 +227,7 @@ Each iteration saves `colored.png`, `mask.png`, and `evaluation.json` to `iterat
 Both the image generation model and the evaluator VLM are pluggable:
 
 - **Image gen backends** (`--gen-backend`): `flux` (default), `gemini`, `glm`, `qwen`, `sam3`.
-- **LLM backends** (`--llm-provider`): `ollama`, `anthropic`, `google`, `openai`, `huggingface`.
+- **LLM backends** (`--llm-provider`): `ollama`, `anthropic`, `google`, `antigravity`, `openai`, `huggingface`.
 
 Qwen backend note: `QwenImageEditPlusPipeline` may require a newer `diffusers` build. If import fails, run:
 
@@ -252,7 +252,7 @@ huggingface-cli login
 SAM3 supports three prompting strategies via `--sam3-strategy`:
 
 - **text** (default): Uses SAM3's open-vocabulary text prompts (e.g. "mitochondria"). The loop cycles through synonym prompts per iteration.
-- **vlm-coordinate**: A VLM examines the EM image and provides (x, y) center coordinates for each organelle instance. Each point is fed to SAM3 independently as its own instance — SAM3 runs one `predict()` call per point and produces a separate mask for each. The evaluator VLM then reviews the result and suggests adding/removing points across refinement iterations.
+- **vlm-coordinate**: A VLM examines the EM image and provides (x, y) points inside each organelle instance. It can also return bounding boxes and polygon outlines with `--point-shape-mode`. Points with the same `instance` ID are fed to SAM3 together for one object; boxes are passed as SAM3 box prompts when present; polygons are saved as region metadata for cleanup/evaluation. The evaluator VLM then reviews the result and suggests adding/removing points across refinement iterations.
 - **painted-marker**: A secondary generative model paints dot markers at organelle centers, which are detected via color difference and converted to SAM3 point prompts (same one-point-per-instance approach).
 
 ```bash
@@ -263,6 +263,12 @@ pixi run segment refine --input image.png --output-dir ./refined/ --organelle mi
 # VLM-coordinate mode — VLM provides point coordinates for SAM3
 pixi run segment refine --input image.png --output-dir ./refined/ --organelle mito \
   --gen-backend sam3 --sam3-strategy vlm-coordinate --llm-provider anthropic
+
+# Antigravity for both point detection and evaluation via the local agy CLI
+pixi run segment refine --input image.png --output-dir ./refined/ --organelle mito \
+  --gen-backend sam3 --sam3-strategy vlm-coordinate \
+  --point-provider antigravity --llm-provider antigravity \
+  --point-shape-mode all
 
 # Painted-marker mode — gen model paints dots, detected and fed to SAM3
 pixi run segment refine --input image.png --output-dir ./refined/ --organelle mito \
@@ -275,10 +281,29 @@ pixi run segment refine --input image.png --output-dir ./refined/ --organelle mi
 | `--sam3-model` | `facebook/sam3` | SAM3 HuggingFace model ID |
 | `--sam3-confidence` | `0.5` | Mask confidence threshold |
 | `--marker-backend` | None | Gen backend for painting markers (required for `painted-marker`) |
+| `--point-shape-mode` | `points` | VLM geometry request: `points`, `boxes`, `polygons`, or `all`; boxes can guide SAM3, polygons are saved as metadata |
 
-The VLM-coordinate strategy also supports a HuggingFace backend (`--llm-provider huggingface`) for local VLM inference, including Molmo models which use native pointing output rather than JSON coordinates.
+The VLM-coordinate strategy also supports Antigravity (`--point-provider antigravity`) via the local `agy` CLI, plus a HuggingFace backend (`--llm-provider huggingface`) for local VLM inference, including Molmo models which use native pointing output rather than JSON coordinates.
 
-Output intermediates include `colored.png` (semi-transparent overlay of instance masks on the EM image), `mask.png` (color-coded instance labels), `points.png` (point prompts visualized on the EM), and `evaluation.json`.
+Crops smaller than 768px on their shortest side are upsampled (Lanczos) before being sent for point detection, so a VLM's own internal image resize doesn't coarsen the coordinate grid it reasons over; returned coordinates are mapped back to the original crop size automatically. Each backend also asks for coordinates in whatever scheme it was actually grounded on — pixel coordinates by default, or 0-1000 normalized coordinates for Gemini-backed providers (`google` and `antigravity`, whose `agy` CLI is Gemini 3.x under the hood) and Molmo, matching their native training convention — rather than forcing every provider to reason in raw pixel space.
+
+Output intermediates include `colored.png` (semi-transparent overlay of instance masks on the EM image), `mask.png` (color-coded instance labels), `points.png` (point/box/polygon prompts visualized on the EM), and `evaluation.json`.
+
+### Google media generation scripts
+
+For programmatic image or movie generation through Google's GenAI SDK, use the standalone script rather than the segmentation loop:
+
+```bash
+# Image generation or editing through Vertex/Agent Platform ADC
+pixi run google-media --gcp-project "$GOOGLE_CLOUD_PROJECT" image \
+  --prompt "Create a clean EM-style mitochondria illustration" \
+  --output outputs/google_media/mito.png
+
+# Video generation writes to GCS
+pixi run google-media --gcp-project "$GOOGLE_CLOUD_PROJECT" video \
+  --prompt "A short scientific animation of mitochondria segmentation in EM data" \
+  --output-gcs-uri gs://your-bucket/ask-to-mask/veo/
+```
 
 ### Z-stack refinement with zarr
 
@@ -311,14 +336,15 @@ pixi run segment refine --zarr-path /path/to/volume.zarr/recon-1/em/fibsem-uint8
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--use-video-predictor` | off | Use SAM3 video predictor for cross-slice mask propagation |
-| `--multi-slice-points` | off | Run Molmo independently on each slice to find points |
-| `--point-sample` | all | Number of slices to sample for Molmo point detection |
-| `--point-provider` | same as `--llm-provider` | VLM provider for point detection (e.g. `huggingface` for Molmo) |
+| `--multi-slice-points` | off | Run point detection independently on each slice |
+| `--point-sample` | all | Number of slices to sample for point detection |
+| `--point-provider` | same as `--llm-provider` | VLM provider for point detection (e.g. `antigravity` or `huggingface` for Molmo) |
 | `--point-model` | None | VLM model for point detection (e.g. `allenai/Molmo2-8B`) |
-| `--point-prompt` | `"Point to the {organelle}"` | Custom prompt for Molmo point detection |
+| `--point-prompt` | `"Point inside each {organelle}"` | Custom prompt for point detection |
+| `--point-shape-mode` | `points` | Ask for `points`, `boxes`, `polygons`, or `all` |
 | `--skip-refinement` | off | Skip iterative evaluation/refinement loop — just detect points and run SAM3 once |
 
-When `--multi-slice-points` is combined with `--use-video-predictor`, Molmo runs on each slice independently to find organelle locations, then those per-slice points are fed as frame-specific prompts to the SAM3 video predictor. The video predictor propagates masks forward and backward, handling cross-slice consistency and filling in slices where Molmo found nothing.
+When `--multi-slice-points` is combined with `--use-video-predictor`, the point provider runs on each slice independently to find organelle locations, then those per-slice points are fed as frame-specific prompts to the SAM3 video predictor. The video predictor propagates masks forward and backward, handling cross-slice consistency and filling in slices where point detection found nothing.
 
 Batch Molmo detection: when using `--multi-slice-points` with Molmo, all slices are processed in a single subprocess call (loading the model once) rather than spawning a new process per slice.
 

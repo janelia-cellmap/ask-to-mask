@@ -293,13 +293,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ref.add_argument(
         "--multi-slice-points",
         action="store_true",
-        help="Run Molmo on each slice independently to find points.",
+        help="Run point detection on each slice independently.",
     )
     ref.add_argument(
         "--point-sample",
         type=int,
         default=None,
-        help="Number of slices to sample for Molmo point detection (default: all).",
+        help="Number of slices to sample for point detection (default: all).",
     )
     ref.add_argument(
         "--output-dir",
@@ -344,18 +344,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ref.add_argument(
         "--llm-provider",
         default="google",
-        choices=["ollama", "anthropic", "google", "openai", "huggingface"],
+        choices=["ollama", "anthropic", "google", "antigravity", "openai", "huggingface"],
         help="LLM/VLM provider for evaluation (default: google).",
     )
     ref.add_argument("--llm-model", default=None, help="LLM model name.")
     ref.add_argument(
         "--point-provider",
         default=None,
-        choices=["ollama", "anthropic", "google", "openai", "huggingface"],
+        choices=["ollama", "anthropic", "google", "antigravity", "openai", "huggingface"],
         help="VLM provider for point detection (default: same as --llm-provider).",
     )
     ref.add_argument("--point-model", default=None, help="VLM model for point detection (e.g. allenai/Molmo2-8B).")
-    ref.add_argument("--point-prompt", default=None, help="Custom prompt for Molmo point detection (default: 'Point to the {organelle}').")
+    ref.add_argument(
+        "--point-temperature",
+        type=float,
+        default=0.0,
+        help="Sampling temperature for the point-detection VLM call (default: 0.0). "
+        "Point detection asks for precise coordinates rather than creative text, and "
+        "higher temperatures were observed to occasionally make Gemini fall back to a "
+        "degenerate uniform grid of points instead of real content-grounded detection.",
+    )
+    ref.add_argument("--point-prompt", default=None, help="Custom prompt for point detection (default: 'Point inside each {organelle}').")
+    ref.add_argument(
+        "--point-shape-mode",
+        default="points",
+        choices=["points", "boxes", "polygons", "all"],
+        help="Geometry to ask the point VLM for: points, boxes, polygons, or all (default: points).",
+    )
     ref.add_argument(
         "--validate-points",
         action="store_true",
@@ -625,23 +640,44 @@ def cmd_refine(args: argparse.Namespace) -> None:
             llm_kwargs["model"] = args.llm_model
         if args.llm_provider == "ollama":
             llm_kwargs["host"] = args.ollama_host
-        if args.vertex_ai:
-            llm_kwargs["vertex_ai"] = True
+        if args.llm_provider in ("google", "antigravity"):
+            gcp_location = (
+                "global"
+                if args.llm_provider == "antigravity" and args.gcp_location == "us-central1"
+                else args.gcp_location
+            )
             llm_kwargs["gcp_project"] = args.gcp_project
-            llm_kwargs["gcp_location"] = args.gcp_location
+            llm_kwargs["gcp_location"] = gcp_location
+            if args.vertex_ai or args.llm_provider == "antigravity":
+                llm_kwargs["vertex_ai"] = True
         llm_backend = create_llm_backend(args.llm_provider, **llm_kwargs)
     else:
         llm_backend = None
 
-    # Build point detection backend (separate VLM for Molmo-style pointing)
+    # Build point detection backend (separate instance from the eval VLM, even when
+    # --point-provider falls back to --llm-provider, so it gets its own — usually
+    # lower — temperature. Point detection asks for precise coordinates, and reusing
+    # the eval backend's default temperature let Gemini occasionally fall back to a
+    # degenerate uniform grid instead of real content-grounded detection.)
     point_backend = None
-    if getattr(args, "point_provider", None):
-        point_kwargs = {}
+    effective_point_provider = getattr(args, "point_provider", None) or args.llm_provider
+    if getattr(args, "point_provider", None) or sam3_strategy == "vlm-coordinate":
+        point_kwargs = {"temperature": args.point_temperature}
         if args.point_model:
             point_kwargs["model"] = args.point_model
-        if args.point_provider == "ollama":
+        if effective_point_provider == "ollama":
             point_kwargs["host"] = args.ollama_host
-        point_backend = create_llm_backend(args.point_provider, **point_kwargs)
+        if effective_point_provider in ("google", "antigravity"):
+            gcp_location = (
+                "global"
+                if effective_point_provider == "antigravity" and args.gcp_location == "us-central1"
+                else args.gcp_location
+            )
+            point_kwargs["gcp_project"] = args.gcp_project
+            point_kwargs["gcp_location"] = gcp_location
+            if args.vertex_ai or effective_point_provider == "antigravity":
+                point_kwargs["vertex_ai"] = True
+        point_backend = create_llm_backend(effective_point_provider, **point_kwargs)
 
     # Build gen backend
     if args.gen_backend == "sam3":
@@ -845,7 +881,11 @@ def cmd_refine(args: argparse.Namespace) -> None:
         print(f"  Gen backend: {args.gen_backend} ({gen_model_name})")
     print(f"  Evaluator: {args.llm_provider} ({eval_model_name})")
     if point_backend:
-        print(f"  Point detection: {args.point_provider} ({args.point_model})")
+        print(
+            f"  Point detection: {effective_point_provider} ({args.point_model}, "
+            f"temperature={args.point_temperature})"
+        )
+        print(f"  Point geometry: {getattr(args, 'point_shape_mode', 'points')}")
     print(f"  Max iterations: {args.max_iterations}, min score: {args.min_score}")
     print(f"  Output: {run_dir}")
 
@@ -876,6 +916,7 @@ def cmd_refine(args: argparse.Namespace) -> None:
             point_backend=point_backend,
             point_model=getattr(args, "point_model", "") or "",
             point_prompt=getattr(args, "point_prompt", None),
+            point_shape_mode=getattr(args, "point_shape_mode", "points"),
             z_start=args.z_start,
             validate_points=getattr(args, "validate_points", False),
             voxel_size=zarr_voxel_size,
@@ -910,6 +951,7 @@ def cmd_refine(args: argparse.Namespace) -> None:
             point_backend=point_backend,
             point_model=getattr(args, "point_model", "") or "",
             point_prompt=getattr(args, "point_prompt", None),
+            point_shape_mode=getattr(args, "point_shape_mode", "points"),
             z_start=args.z_start,
             validate_points=getattr(args, "validate_points", False),
         )
@@ -944,6 +986,8 @@ def cmd_refine(args: argparse.Namespace) -> None:
             llm_model=getattr(args, "llm_model", "") or "",
             point_backend=point_backend,
             point_model=getattr(args, "point_model", "") or "",
+            point_prompt=getattr(args, "point_prompt", None),
+            point_shape_mode=getattr(args, "point_shape_mode", "points"),
             validate_points=getattr(args, "validate_points", False),
         )
 

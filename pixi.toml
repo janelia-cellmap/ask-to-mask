@@ -21,6 +21,8 @@ segment = "python -m ask_to_mask.cli"
 train = "python -m ask_to_mask.cli train"
 train-mito-2p5d = "python -m ask_to_mask.cli train-mito-2p5d"
 pretrain-mito-2p5d = "python -m ask_to_mask.cli pretrain-mito-2p5d"
+google-media = "python scripts/google_media.py"
+crop-cellmap-test = "python scripts/crop_cellmap_test_manifest.py"
 
 # Molmo environment: pinned transformers <5 for Molmo2-8B compatibility
 [feature.molmo.pypi-dependencies]

@@ -98,6 +98,8 @@ def run_refinement_loop(
     llm_model: str = "",
     point_backend: LLMBackend | None = None,
     point_model: str = "",
+    point_prompt: str | None = None,
+    point_shape_mode: str = "points",
     validate_points: bool = False,
 ) -> LoopResult:
     """Run the generate-evaluate-refine loop.
@@ -122,22 +124,24 @@ def run_refinement_loop(
             gen_model=gen_model,
             resolution_nm=resolution_nm,
             llm_model=llm_model,
+            point_prompt=point_prompt,
             point_backend=point_backend,
             point_model=point_model,
+            point_shape_mode=point_shape_mode,
         )
 
     if use_points:
         if existing_points:
             print(f"\n=== Using pre-detected points ({len(existing_points)} locations) ===")
             for p in existing_points:
-                print(f"    ({p['x']}, {p['y']}) label={p.get('label', 1)}")
+                print(f"    {_format_point_prompt(p)}")
             points = existing_points
         else:
-            print("\n=== Generating initial points via VLM ===")
+            print(f"\n=== Generating initial geometry via VLM ({point_shape_mode}) ===")
             points = evaluator.generate_initial_points(em_image, organelle)
             print(f"  Initial points: {len(points)} locations")
             for p in points:
-                print(f"    ({p['x']}, {p['y']}) label={p.get('label', 1)}")
+                print(f"    {_format_point_prompt(p)}")
         # Optionally validate each point via the eval VLM
         if validate_points and points:
             print("\n=== Validating points via eval VLM ===")
@@ -628,7 +632,7 @@ def _save_iteration(
 def _draw_points_on_image(
     em_image: Image.Image, points: list[dict]
 ) -> Image.Image:
-    """Draw point prompts on the EM image, color-coded by instance ID."""
+    """Draw point, box, and polygon prompts on the EM image, color-coded by instance ID."""
     from PIL import ImageDraw
 
     # Distinct colors for instances (cycle if more than 10)
@@ -643,6 +647,8 @@ def _draw_points_on_image(
     draw = ImageDraw.Draw(img)
     # Scale radius to image size — at least 6px, up to ~2% of the shorter side
     radius = max(6, min(img.width, img.height) // 50)
+    line_width = max(2, radius // 3)
+    drawn_regions: set[int] = set()
 
     for i, p in enumerate(points):
         x, y = p["x"], p["y"]
@@ -650,6 +656,19 @@ def _draw_points_on_image(
         if label == 1:
             inst_id = p.get("instance", i)
             color = INSTANCE_COLORS[inst_id % len(INSTANCE_COLORS)]
+            if inst_id not in drawn_regions:
+                bbox = p.get("bbox")
+                if isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
+                    draw.rectangle(
+                        [int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])],
+                        outline=color,
+                        width=line_width,
+                    )
+                polygon = p.get("polygon")
+                poly_xy = _polygon_xy(polygon)
+                if poly_xy:
+                    draw.line(poly_xy + [poly_xy[0]], fill=color, width=line_width)
+                drawn_regions.add(inst_id)
         else:
             color = BG_COLOR
         draw.ellipse(
@@ -670,6 +689,31 @@ def _draw_points_on_image(
         )
 
     return img
+
+
+def _polygon_xy(polygon: object) -> list[tuple[int, int]] | None:
+    """Return drawable polygon coordinates if present."""
+    if not isinstance(polygon, list):
+        return None
+    pts: list[tuple[int, int]] = []
+    for p in polygon:
+        if isinstance(p, dict) and "x" in p and "y" in p:
+            pts.append((int(p["x"]), int(p["y"])))
+        elif isinstance(p, (list, tuple)) and len(p) >= 2:
+            pts.append((int(p[0]), int(p[1])))
+    return pts if len(pts) >= 3 else None
+
+
+def _format_point_prompt(p: dict) -> str:
+    """Compact CLI display for a SAM3/VLM prompt point."""
+    parts = [f"({p['x']}, {p['y']})", f"label={p.get('label', 1)}"]
+    if p.get("label", 1) == 1:
+        parts.append(f"instance={p.get('instance', '?')}")
+    if p.get("bbox"):
+        parts.append(f"bbox={p['bbox']}")
+    if p.get("polygon"):
+        parts.append(f"polygon_vertices={len(p['polygon'])}")
+    return " ".join(parts)
 
 
 def _save_evaluation(

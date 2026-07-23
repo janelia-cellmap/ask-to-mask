@@ -108,25 +108,55 @@ Respond with ONLY JSON:
 """
 
 
+_PIXEL_COORD_INSTR = (
+    "Provide coordinates as (x, y) pixel coordinates in the image shown. The origin (0, 0) is "
+    "the top-left corner. x increases to the right, y increases downward."
+)
+_NORMALIZED_COORD_INSTR = (
+    "Provide coordinates as (x, y) normalized to a 0-1000 scale, NOT raw pixels: (0, 0) is the "
+    "top-left corner and (1000, 1000) is the bottom-right corner, regardless of the image's "
+    "actual pixel dimensions. x increases to the right, y increases downward."
+)
+
+
 VLM_INITIAL_POINTS_PROMPT = """\
 We segment organelles in electron microscopy (EM) images using SAM3 (Segment Anything Model 3) \
-with point prompts. You identify the approximate center locations of target organelles in the EM \
+with point prompts. You identify points inside target organelles in the EM \
 image so we can feed those coordinates to SAM3.
 
 You will see the EM image. Identify each visible instance of the target organelle and provide \
-its approximate center (x, y) in pixel coordinates. The origin (0, 0) is the top-left corner. \
-x increases to the right, y increases downward.
+one or more points inside it. {coord_instr}
 
-Provide foreground points (label=1) at organelle centers. If there are obvious non-organelle \
+Provide foreground points (label=1) inside organelles. If there are obvious non-organelle \
 regions that might confuse the model, you may also add background points (label=0).
 
 Assign each foreground point an instance ID (integer). Points with the same instance ID will be \
 used to segment the same object. Each distinct organelle should have a unique instance ID \
-(starting from 0). For large or elongated organelles, you may place multiple points on the same \
-instance. Background points (label=0) do not need an instance ID.
+(starting from 0). Background points (label=0) do not need an instance ID.
 
 Respond with ONLY JSON:
 {"points": [{"x": 100, "y": 200, "label": 1, "instance": 0}, {"x": 300, "y": 400, "label": 1, "instance": 1}], "reasoning": "why these points"}\
+"""
+
+VLM_INITIAL_REGIONS_PROMPT = """\
+We segment organelles in electron microscopy (EM) images using SAM3 (Segment Anything Model 3) \
+with VLM-provided geometric coordinates. You identify target organelles in the EM image and \
+provide coordinates we can use as segmentation prompts and downstream cleanup metadata.
+
+You will see the EM image. Identify each visible instance of the target organelle. {coord_instr}
+
+For each instance, provide the requested geometry using that same coordinate scale:
+- points: one or more foreground points inside the organelle, used as SAM3 point prompts
+- bbox: a tight bounding box around the organelle as x1, y1, x2, y2, usable as a SAM3 box prompt
+- polygon: a polygon surrounding the organelle, with vertices ordered around the boundary; this is \
+saved for downstream cleanup/evaluation rather than passed directly to SAM3
+
+Each distinct organelle should have a unique instance ID starting from 0. If requested geometry \
+is uncertain, still provide at least one point inside the organelle. You may also add background \
+points (label=0) outside organelles if they help avoid confusing non-organelle structures.
+
+Respond with ONLY JSON:
+{"instances": [{"instance": 0, "points": [{"x": 100, "y": 200}], "bbox": {"x1": 80, "y1": 170, "x2": 150, "y2": 230}, "polygon": [{"x": 82, "y": 190}, {"x": 110, "y": 172}, {"x": 148, "y": 205}, {"x": 118, "y": 228}]}], "background_points": [{"x": 20, "y": 20, "label": 0}], "reasoning": "why these regions"}\
 """
 
 SAM3_COORDINATE_SYSTEM_PROMPT = """\
@@ -157,7 +187,7 @@ Respond with ONLY JSON:
 """
 
 
-MOLMO_POINTS_PROMPT = "Point to each {organelle} in this EM image. They are dark, blobby shapes — oval, elongated, or irregular, not necessarily perfect circles."
+MOLMO_POINTS_PROMPT = "Point inside each {organelle} in this EM image."
 
 POINT_VALIDATION_PROMPT = """\
 You are validating whether a marked location in an electron microscopy (EM) image \
@@ -174,6 +204,25 @@ or
 """
 
 
+def _upsample_for_points(image: Image.Image, floor: int = 768) -> tuple[Image.Image, float]:
+    """Upsample a crop before sending it to a VLM for point/box/polygon detection.
+
+    Small crops sent as-is can end up below a VLM's internal working resolution,
+    which means the API silently upsamples with an interpolation method we don't
+    control and effectively coarsens the coordinate grid the model reasons over.
+    Upsampling ourselves (Lanczos) beforehand caps how much detail that internal
+    resize can destroy. Returns the (possibly resized) image and the scale factor
+    applied — divide any pixel coordinates the VLM returns for the resized image
+    by this factor to map back to the original image's pixel space.
+    """
+    w, h = image.size
+    scale = max(1.0, floor / min(w, h))
+    if scale == 1.0:
+        return image, 1.0
+    new_size = (round(w * scale), round(h * scale))
+    return image.resize(new_size, Image.LANCZOS), scale
+
+
 class EvaluatorAgent:
     """Evaluates mask quality and refines prompts using a VLM backend."""
 
@@ -187,6 +236,7 @@ class EvaluatorAgent:
         point_prompt: str | None = None,
         point_backend: LLMBackend | None = None,
         point_model: str = "",
+        point_shape_mode: str = "points",
     ):
         self.backend = backend
         self.instance = instance
@@ -196,6 +246,7 @@ class EvaluatorAgent:
         # Dedicated point detection backend/model (falls back to eval backend)
         self.point_backend = point_backend or backend
         self.point_model = point_model or llm_model
+        self.point_shape_mode = point_shape_mode.lower()
         self.is_molmo = "molmo" in self.point_model.lower()
         # Stores VLM prompts used for the most recent initial generation call
         self.last_init_vlm_prompts: dict | None = None
@@ -277,11 +328,13 @@ class EvaluatorAgent:
         em_image: Image.Image,
         organelle: OrganelleClass,
     ) -> list[dict]:
-        """Ask the VLM to identify organelle locations as (x, y) point coordinates."""
+        """Ask the VLM to identify organelle locations as point/box/polygon coordinates."""
         if self.is_molmo:
             return self._generate_initial_points_molmo(em_image, organelle)
 
-        w, h = em_image.size
+        send_image, scale = _upsample_for_points(em_image)
+        use_normalized = self.point_backend.native_point_scale == "normalized_1000"
+        w, h = send_image.size
         parts = [
             f"Target organelle: {organelle.name}.",
             f"Image dimensions: {w} x {h} pixels.",
@@ -290,16 +343,40 @@ class EvaluatorAgent:
             parts.append(f"In EM, {organelle.name} appear as: {organelle.description}")
         if self.resolution_nm is not None:
             parts.append(f"Image resolution: {self.resolution_nm:.0f} nm/px.")
-        parts.append("\nIdentify each visible instance and provide center coordinates. Respond with JSON only.")
+        if self.point_prompt:
+            parts.append(f"\nTask: {self.point_prompt}")
+        elif self.point_shape_mode == "points":
+            parts.append("\nIdentify each visible instance and provide point coordinates inside it.")
+        else:
+            parts.append(
+                "\nIdentify each visible instance and provide the requested geometry "
+                f"for mode '{self.point_shape_mode}'."
+            )
+        parts.append("Respond with JSON only.")
         user_prompt = "\n".join(parts)
 
-        raw = self.point_backend.chat_with_image(VLM_INITIAL_POINTS_PROMPT, user_prompt, em_image)
+        system_prompt = self._initial_points_system_prompt(use_normalized)
+        raw = self.point_backend.chat_with_image(system_prompt, user_prompt, send_image)
         self.last_init_vlm_prompts = {
-            "system": VLM_INITIAL_POINTS_PROMPT,
+            "system": system_prompt,
             "user": user_prompt,
             "raw_response": raw[:2000],
         }
-        return self._parse_initial_points(raw, em_image)
+        return self._parse_initial_points(raw, em_image, scale=scale, normalized=use_normalized)
+
+    def _initial_points_system_prompt(self, use_normalized: bool = False) -> str:
+        """Build the system prompt for initial point/box/polygon detection."""
+        coord_instr = _NORMALIZED_COORD_INSTR if use_normalized else _PIXEL_COORD_INSTR
+        mode = self.point_shape_mode
+        if mode == "points":
+            return VLM_INITIAL_POINTS_PROMPT.replace("{coord_instr}", coord_instr)
+        requested = {
+            "boxes": "For each instance, provide bbox and at least one point inside it. polygon may be omitted.",
+            "polygons": "For each instance, provide polygon and at least one point inside it. bbox may be omitted.",
+            "all": "For each instance, provide points, bbox, and polygon.",
+        }.get(mode, "For each instance, provide points inside it.")
+        base = VLM_INITIAL_REGIONS_PROMPT.replace("{coord_instr}", coord_instr)
+        return f"{base}\n\nRequested geometry mode: {mode}.\n{requested}"
 
     def generate_points_per_slice(
         self,
@@ -383,12 +460,16 @@ class EvaluatorAgent:
 
         model_name = getattr(self.point_backend, "model_name", "allenai/Molmo2-8B")
 
-        # Save all images to temp files and create a JSON manifest
+        # Save all images to temp files (upsampled if small — see _upsample_for_points)
+        # and create a JSON manifest
         tmp_dir = tempfile.mkdtemp()
         tmp_paths = []
+        scales = []
         for i, img in enumerate(images):
+            send_img, scale = _upsample_for_points(img)
+            scales.append(scale)
             tmp_path = Path(tmp_dir) / f"slice_{i}.png"
-            img.save(tmp_path, format="PNG")
+            send_img.save(tmp_path, format="PNG")
             tmp_paths.append(str(tmp_path))
 
         manifest_path = Path(tmp_dir) / "manifest.json"
@@ -422,6 +503,7 @@ class EvaluatorAgent:
                 raw = batch_result.get("raw", "")
                 print(f"  Slice {idx+1}: {len(points)} points")
                 if points:
+                    points = self._rescale_points(points, scales[i], images[i].size)
                     per_slice_points[idx] = self._assign_instance_ids(points)
                 else:
                     per_slice_points[idx] = []
@@ -445,26 +527,107 @@ class EvaluatorAgent:
             import shutil
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    def _parse_initial_points(self, raw: str, em_image: Image.Image) -> list[dict]:
-        """Extract point coordinates from the VLM's response."""
-        text = raw[:4000]
+    @staticmethod
+    def _raw_to_px(value: float, dim: int, scale: float, normalized: bool) -> int:
+        """Convert one coordinate value from the VLM's response frame to pixel space.
+
+        `dim` is the target (original image) size along that axis. `normalized`
+        coordinates are on a 0-1000 scale regardless of image size; otherwise
+        `value` is a pixel coordinate in the (possibly upsampled) image the VLM
+        actually saw, so divide by `scale` to map back to the original image.
+        """
+        px = (value / 1000.0 * dim) if normalized else (value / scale)
+        return max(0, min(dim - 1, round(px)))
+
+    @staticmethod
+    def _rescale_points(
+        points: list[dict], scale: float, orig_size: tuple[int, int]
+    ) -> list[dict]:
+        """Map pixel points detected on an upsampled image back to the original size."""
+        if scale == 1.0:
+            return points
+        w, h = orig_size
+        return [
+            {**p, "x": max(0, min(w - 1, round(p["x"] / scale))),
+             "y": max(0, min(h - 1, round(p["y"] / scale)))}
+            for p in points
+        ]
+
+    def _to_pixel_space(
+        self, parsed: dict, w: int, h: int, scale: float, normalized: bool
+    ) -> None:
+        """Convert coordinates in a parsed VLM JSON response to original pixel space, in place.
+
+        No-op when the VLM was sent the image unscaled and responded in plain pixel
+        coordinates (the common case for backends without `native_point_scale ==
+        "normalized_1000"` and crops already at/above the upsample floor).
+        """
+        if not normalized and scale == 1.0:
+            return
+
+        def conv(d: object) -> None:
+            if not isinstance(d, dict):
+                return
+            for key, dim in (
+                ("x", w), ("y", h), ("x1", w), ("y1", h), ("x2", w), ("y2", h),
+            ):
+                if key in d:
+                    d[key] = self._raw_to_px(float(d[key]), dim, scale, normalized)
+
+        for pt in parsed.get("points", []) or []:
+            conv(pt)
+        for pt in parsed.get("background_points", []) or []:
+            conv(pt)
+        for inst in (
+            parsed.get("instances") or parsed.get("objects") or parsed.get("regions") or []
+        ):
+            if not isinstance(inst, dict):
+                continue
+            conv(inst.get("bbox") or inst.get("box"))
+            for pt in inst.get("points", []) or inst.get("interior_points", []) or []:
+                conv(pt)
+            for pt in inst.get("polygon", []) or []:
+                conv(pt)
+
+    def _parse_initial_points(
+        self,
+        raw: str,
+        em_image: Image.Image,
+        scale: float = 1.0,
+        normalized: bool = False,
+    ) -> list[dict]:
+        """Extract point coordinates from the VLM's response.
+
+        `scale`/`normalized` describe the coordinate frame the VLM actually
+        responded in (see `_upsample_for_points` and `native_point_scale`) —
+        coordinates are converted back to `em_image`'s original pixel space
+        before any clamping/parsing below.
+        """
+        text = raw[:200000]
+        w, h = em_image.size
         json_str = self._extract_json_object(text)
         if json_str:
             try:
                 parsed = json.loads(json_str)
+                self._to_pixel_space(parsed, w, h, scale, normalized)
+                region_points = self._parse_region_instances(parsed, em_image)
+                if region_points:
+                    reasoning = parsed.get("reasoning", "")
+                    if reasoning:
+                        print(f"  VLM points reasoning: {reasoning}")
+                    return region_points
                 points = parsed.get("points", [])
                 if points and isinstance(points, list):
                     reasoning = parsed.get("reasoning", "")
                     if reasoning:
                         print(f"  VLM points reasoning: {reasoning}")
                     # Validate and clamp coordinates
-                    w, h = em_image.size
                     valid_points = []
                     for i, p in enumerate(points):
                         if isinstance(p, dict) and "x" in p and "y" in p:
                             pt = {
-                                "x": max(0, min(w - 1, int(p["x"]))),
-                                "y": max(0, min(h - 1, int(p["y"]))),
+                                "x": max(0, min(w - 1, round(float(p["x"])))),
+                                "y": max(0, min(h - 1, round(float(p["y"])))),
                                 "label": int(p.get("label", 1)),
                             }
                             # Preserve instance ID; default to index if omitted
@@ -475,18 +638,23 @@ class EvaluatorAgent:
             except json.JSONDecodeError:
                 pass
 
+        region_points = self._parse_region_instances_from_text(
+            text, em_image, scale=scale, normalized=normalized
+        )
+        if region_points:
+            return region_points
+
         # Fallback: try to extract points with regex (JSON dict format)
         point_matches = re.findall(
             r'\{\s*"x"\s*:\s*(\d+)\s*,\s*"y"\s*:\s*(\d+)(?:\s*,\s*"label"\s*:\s*(\d+))?\s*\}',
             text,
         )
         if point_matches:
-            w, h = em_image.size
             result = []
             for i, m in enumerate(point_matches):
                 pt = {
-                    "x": max(0, min(w - 1, int(m[0]))),
-                    "y": max(0, min(h - 1, int(m[1]))),
+                    "x": self._raw_to_px(float(m[0]), w, scale, normalized),
+                    "y": self._raw_to_px(float(m[1]), h, scale, normalized),
                     "label": int(m[2]) if m[2] else 1,
                 }
                 if pt["label"] == 1:
@@ -518,6 +686,222 @@ class EvaluatorAgent:
         print("  Warning: could not parse VLM points, using image center as fallback")
         return [{"x": w // 2, "y": h // 2, "label": 1, "instance": 0}]
 
+    def _parse_region_instances(self, parsed: dict, em_image: Image.Image) -> list[dict]:
+        """Parse richer instance geometry JSON into SAM3 prompt point dicts."""
+        instances = parsed.get("instances") or parsed.get("objects") or parsed.get("regions")
+        if not isinstance(instances, list):
+            return []
+
+        w, h = em_image.size
+        result: list[dict] = []
+        for i, obj in enumerate(instances):
+            if not isinstance(obj, dict):
+                continue
+            inst_id = int(obj.get("instance", obj.get("id", i)))
+            bbox = self._normalize_bbox(obj.get("bbox") or obj.get("box"), w, h)
+            polygon = self._normalize_polygon(obj.get("polygon"), w, h)
+            raw_points = obj.get("points") or obj.get("interior_points") or []
+            fg_points = []
+            for p in raw_points:
+                pt = self._normalize_point(p, w, h)
+                if pt is not None:
+                    fg_points.append(pt)
+
+            if not fg_points and polygon:
+                fg_points = [self._polygon_centroid(polygon, w, h)]
+            if not fg_points and bbox:
+                x1, y1, x2, y2 = bbox
+                fg_points = [{"x": int(round((x1 + x2) / 2)), "y": int(round((y1 + y2) / 2))}]
+
+            for j, pt in enumerate(fg_points):
+                out = {
+                    "x": pt["x"],
+                    "y": pt["y"],
+                    "label": 1,
+                    "instance": inst_id,
+                }
+                if bbox:
+                    out["bbox"] = bbox
+                if polygon:
+                    out["polygon"] = polygon
+                result.append(out)
+
+        for p in parsed.get("background_points", []) or []:
+            pt = self._normalize_point(p, w, h)
+            if pt is not None:
+                result.append({"x": pt["x"], "y": pt["y"], "label": 0})
+
+        return result
+
+    def _parse_region_instances_from_text(
+        self,
+        text: str,
+        em_image: Image.Image,
+        scale: float = 1.0,
+        normalized: bool = False,
+    ) -> list[dict]:
+        """Recover instance points/boxes/polygons from malformed long JSON-like VLM output.
+
+        Splits the text into per-instance chunks (bounded by successive
+        "instance": N markers) and parses each chunk's points/bbox/polygon
+        independently — truncation can drop any one of those fields (e.g. cut
+        off mid-polygon) without the other fields for that same instance being
+        invalid, so requiring all of them together (as a single combined regex
+        would) drops instances unnecessarily.
+        """
+        orig_w, orig_h = em_image.size
+        # Clamp in the frame the VLM actually responded in; rescaled to
+        # orig_w/orig_h at the end, once all points/boxes/polygons are collected.
+        w, h = (1000, 1000) if normalized else (round(orig_w * scale), round(orig_h * scale))
+        result: list[dict] = []
+
+        inst_markers = list(re.finditer(r'"instance"\s*:\s*(\d+)', text))
+        for i, marker in enumerate(inst_markers):
+            inst_id = int(marker.group(1))
+            chunk_end = inst_markers[i + 1].start() if i + 1 < len(inst_markers) else len(text)
+            chunk = text[marker.end():chunk_end]
+
+            points_match = re.search(r'"points"\s*:\s*(\[[^\]]*\])', chunk, re.DOTALL)
+            points = self._parse_jsonish_points(points_match.group(1), w, h) if points_match else []
+
+            bbox_match = re.search(r'"bbox"\s*:\s*(\{[^}]*\}|\[[^\]]*\])', chunk, re.DOTALL)
+            bbox = self._parse_jsonish_bbox(bbox_match.group(1), w, h) if bbox_match else None
+
+            polygon_match = re.search(r'"polygon"\s*:\s*(\[[^\]]*\])', chunk, re.DOTALL)
+            polygon = self._parse_jsonish_points(polygon_match.group(1), w, h) if polygon_match else []
+            polygon = polygon if len(polygon) >= 3 else None
+
+            if not points and bbox:
+                x1, y1, x2, y2 = bbox
+                points = [
+                    {
+                        "x": int(round((x1 + x2) / 2)),
+                        "y": int(round((y1 + y2) / 2)),
+                    }
+                ]
+            if not points and polygon:
+                points = [self._polygon_centroid(polygon, w, h)]
+
+            for pt in points:
+                out = {
+                    "x": pt["x"],
+                    "y": pt["y"],
+                    "label": 1,
+                    "instance": inst_id,
+                }
+                if bbox:
+                    out["bbox"] = bbox
+                if polygon:
+                    out["polygon"] = polygon
+                result.append(out)
+
+        bg_match = re.search(r'"background_points"\s*:\s*(\[[^\]]*\])', text, re.DOTALL)
+        if bg_match:
+            for pt in self._parse_jsonish_points(bg_match.group(1), w, h):
+                result.append({"x": pt["x"], "y": pt["y"], "label": 0})
+
+        if result:
+            n_boxes = sum(1 for p in result if p.get("bbox"))
+            n_polys = sum(1 for p in result if p.get("polygon"))
+            print(
+                f"  Parsed {len(result)} geometry prompts from malformed JSON "
+                f"({n_boxes} with boxes, {n_polys} with polygons)"
+            )
+            if normalized or scale != 1.0:
+                for item in result:
+                    item["x"] = self._raw_to_px(item["x"], orig_w, scale, normalized)
+                    item["y"] = self._raw_to_px(item["y"], orig_h, scale, normalized)
+                    if item.get("bbox"):
+                        x1, y1, x2, y2 = item["bbox"]
+                        item["bbox"] = [
+                            self._raw_to_px(x1, orig_w, scale, normalized),
+                            self._raw_to_px(y1, orig_h, scale, normalized),
+                            self._raw_to_px(x2, orig_w, scale, normalized),
+                            self._raw_to_px(y2, orig_h, scale, normalized),
+                        ]
+                    if item.get("polygon"):
+                        item["polygon"] = [
+                            {
+                                "x": self._raw_to_px(p["x"], orig_w, scale, normalized),
+                                "y": self._raw_to_px(p["y"], orig_h, scale, normalized),
+                            }
+                            for p in item["polygon"]
+                        ]
+        return result
+
+    def _parse_jsonish_points(self, text: str, w: int, h: int) -> list[dict]:
+        points: list[dict] = []
+        for x, y in re.findall(r'"x"\s*:\s*(-?\d+(?:\.\d+)?)\s*,\s*"y"\s*:\s*(-?\d+(?:\.\d+)?)', text):
+            points.append(
+                {
+                    "x": max(0, min(w - 1, int(round(float(x))))),
+                    "y": max(0, min(h - 1, int(round(float(y))))),
+                }
+            )
+        return points
+
+    def _parse_jsonish_bbox(self, text: str, w: int, h: int) -> list[int] | None:
+        try:
+            return self._normalize_bbox(json.loads(text), w, h)
+        except json.JSONDecodeError:
+            pairs = dict(re.findall(r'"(x1|y1|x2|y2|x|y|width|height)"\s*:\s*(-?\d+(?:\.\d+)?)', text))
+            if pairs:
+                return self._normalize_bbox({k: float(v) for k, v in pairs.items()}, w, h)
+        return None
+
+    @staticmethod
+    def _normalize_point(point: object, w: int, h: int) -> dict | None:
+        if isinstance(point, dict) and "x" in point and "y" in point:
+            x, y = point["x"], point["y"]
+        elif isinstance(point, (list, tuple)) and len(point) >= 2:
+            x, y = point[0], point[1]
+        else:
+            return None
+        return {
+            "x": max(0, min(w - 1, int(round(float(x))))),
+            "y": max(0, min(h - 1, int(round(float(y))))),
+        }
+
+    @staticmethod
+    def _normalize_bbox(box: object, w: int, h: int) -> list[int] | None:
+        if isinstance(box, dict):
+            if all(k in box for k in ("x1", "y1", "x2", "y2")):
+                vals = [box["x1"], box["y1"], box["x2"], box["y2"]]
+            elif all(k in box for k in ("x", "y", "width", "height")):
+                vals = [box["x"], box["y"], float(box["x"]) + float(box["width"]), float(box["y"]) + float(box["height"])]
+            else:
+                return None
+        elif isinstance(box, (list, tuple)) and len(box) >= 4:
+            vals = list(box[:4])
+        else:
+            return None
+
+        x1, y1, x2, y2 = [float(v) for v in vals]
+        x1, x2 = sorted((x1, x2))
+        y1, y2 = sorted((y1, y2))
+        return [
+            max(0, min(w - 1, int(round(x1)))),
+            max(0, min(h - 1, int(round(y1)))),
+            max(0, min(w - 1, int(round(x2)))),
+            max(0, min(h - 1, int(round(y2)))),
+        ]
+
+    def _normalize_polygon(self, polygon: object, w: int, h: int) -> list[dict] | None:
+        if not isinstance(polygon, list):
+            return None
+        pts = [self._normalize_point(p, w, h) for p in polygon]
+        pts = [p for p in pts if p is not None]
+        return pts if len(pts) >= 3 else None
+
+    @staticmethod
+    def _polygon_centroid(polygon: list[dict], w: int, h: int) -> dict:
+        x = sum(p["x"] for p in polygon) / len(polygon)
+        y = sum(p["y"] for p in polygon) / len(polygon)
+        return {
+            "x": max(0, min(w - 1, int(round(x)))),
+            "y": max(0, min(h - 1, int(round(y)))),
+        }
+
     def _generate_initial_points_molmo(
         self, em_image: Image.Image, organelle: OrganelleClass
     ) -> list[dict]:
@@ -540,9 +924,10 @@ class EvaluatorAgent:
             "user": prompt,
         }
 
-        # Save image to temp file for subprocess
+        # Save image to temp file for subprocess (upsampled if small — see _upsample_for_points)
+        send_image, scale = _upsample_for_points(em_image)
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-            em_image.save(f, format="PNG")
+            send_image.save(f, format="PNG")
             tmp_path = f.name
 
         try:
@@ -584,6 +969,7 @@ class EvaluatorAgent:
 
             if points:
                 print(f"  Molmo detected {len(points)} points")
+                points = self._rescale_points(points, scale, em_image.size)
                 return self._assign_instance_ids(points)
 
         except Exception as e:
@@ -706,9 +1092,16 @@ class EvaluatorAgent:
             draw.line([x - r, y, x + r, y], fill="red", width=2)
             draw.line([x, y - r, x, y + r], fill="red", width=2)
 
+            # Upsample small crops so the marker/organelle boundary stays legible
+            # to the VLM's own internal resize (no coordinates come back here,
+            # so no scale bookkeeping is needed beyond the text description below).
+            send_marked, vscale = _upsample_for_points(marked)
+            send_x, send_y = round(x * vscale), round(y * vscale)
+
             # Build user prompt
             parts = [
-                f"The red marker is at pixel ({x}, {y}) in this {em_image.size[0]}x{em_image.size[1]} EM image.",
+                f"The red marker is at pixel ({send_x}, {send_y}) in this "
+                f"{send_marked.size[0]}x{send_marked.size[1]} EM image.",
                 f"Target organelle: {organelle.name}.",
             ]
             if organelle.description:
@@ -720,7 +1113,7 @@ class EvaluatorAgent:
 
             try:
                 raw = self.backend.chat_with_image(
-                    POINT_VALIDATION_PROMPT, user_prompt, marked
+                    POINT_VALIDATION_PROMPT, user_prompt, send_marked
                 )
                 # Parse response
                 json_str = raw.strip()

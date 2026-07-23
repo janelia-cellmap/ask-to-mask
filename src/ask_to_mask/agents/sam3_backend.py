@@ -22,6 +22,15 @@ MARKER_PROMPT_TEMPLATE = (
 )
 
 
+def _first_bbox(points: list[dict]) -> np.ndarray | None:
+    """Return the first valid SAM3 XYXY box attached to a point."""
+    for p in points:
+        bbox = p.get("bbox")
+        if isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
+            return np.array([float(v) for v in bbox[:4]], dtype=np.float32)
+    return None
+
+
 class SAM3Backend(ImageGenBackend):
     """Segment Anything Model 3 backend.
 
@@ -225,11 +234,13 @@ class SAM3Backend(ImageGenBackend):
         image: Image.Image,
         points: list[dict],
     ) -> np.ndarray:
-        """Run SAM3 point-prompt segmentation using the inst_interactive_predictor.
+        """Run SAM3 point/box-prompt segmentation using the inst_interactive_predictor.
 
         Args:
             image: Input image.
-            points: List of dicts with 'x', 'y', and optional 'label' (1=fg, 0=bg).
+            points: List of dicts with 'x', 'y', optional 'label' (1=fg, 0=bg),
+                and optional 'bbox' as [x1, y1, x2, y2]. Polygon metadata is
+                retained by the caller but is not passed directly to SAM3.
 
         Returns:
             Binary mask as uint8 numpy array (H, W), 0 or 255.
@@ -266,15 +277,18 @@ class SAM3Backend(ImageGenBackend):
             if bg_coords is not None:
                 coords = np.concatenate([coords, bg_coords], axis=0)
                 labels = np.concatenate([labels, bg_labels], axis=0)
+            box = _first_bbox(inst_points)
 
             masks, scores, _ = predictor.predict(
                 point_coords=coords,
                 point_labels=labels,
+                box=box,
                 multimask_output=True,
             )
             best_idx = int(np.argmax(scores))
             pts_str = ", ".join(f"({p['x']}, {p['y']})" for p in inst_points)
-            print(f"  Instance {inst_id} [{pts_str}]: best score={scores[best_idx]:.3f}")
+            box_str = f" box={box.astype(int).tolist()}" if box is not None else ""
+            print(f"  Instance {inst_id} [{pts_str}]{box_str}: best score={scores[best_idx]:.3f}")
             label_counter += 1
             instance_mask = masks[best_idx] > 0
             # Only label pixels not already claimed by another instance

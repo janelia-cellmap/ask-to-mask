@@ -19,6 +19,13 @@ class LLMBackend(ABC):
     and returns the model's text response.
     """
 
+    # Coordinate convention this backend was actually grounded/fine-tuned on for
+    # pointing tasks. "pixel" = absolute (x, y) pixel coordinates in the image
+    # shown. "normalized_1000" = (x, y) on a 0-1000 scale regardless of the
+    # image's actual pixel dimensions (Gemini's documented spatial-understanding
+    # convention, same scheme Molmo2 natively outputs).
+    native_point_scale: str = "pixel"
+
     @abstractmethod
     def chat_with_images(
         self, system_prompt: str, user_prompt: str, images: list[Image.Image]
@@ -184,6 +191,11 @@ class AnthropicBackend(LLMBackend):
 class GoogleBackend(LLMBackend):
     """Google Gemini API (API key or Vertex AI)."""
 
+    # Gemini's grounding/spatial-understanding training uses 0-1000 normalized
+    # coordinates, not raw pixels — asking it to reason in pixel space directly
+    # is off-distribution and less reliable.
+    native_point_scale = "normalized_1000"
+
     def __init__(
         self,
         model: str = "gemini-2.5-flash",
@@ -200,26 +212,39 @@ class GoogleBackend(LLMBackend):
         self.vertex_ai = vertex_ai
         self.temperature = temperature
 
-    def chat_with_images(
-        self, system_prompt: str, user_prompt: str, images: list[Image.Image]
-    ) -> str:
+    def _make_client(self):
         import os
 
         from google import genai
-        from google.genai.errors import ClientError
 
         if self.vertex_ai:
             project = self.gcp_project or os.environ.get("GOOGLE_CLOUD_PROJECT")
-            client = genai.Client(
+            location = (
+                self.gcp_location
+                or os.environ.get("GOOGLE_CLOUD_LOCATION")
+                or "us-central1"
+            )
+            if not project:
+                raise ValueError(
+                    "Vertex AI requires a GCP project. Set GOOGLE_CLOUD_PROJECT "
+                    "or pass --gcp-project."
+                )
+            return genai.Client(
                 vertexai=True,
                 project=project,
-                location=self.gcp_location,
+                location=location,
             )
-        elif self.api_key:
-            client = genai.Client(api_key=self.api_key)
-        else:
-            client = genai.Client()
+        if self.api_key:
+            return genai.Client(api_key=self.api_key)
+        return genai.Client()
 
+    def chat_with_images(
+        self, system_prompt: str, user_prompt: str, images: list[Image.Image]
+    ) -> str:
+        from google import genai
+        from google.genai.errors import ClientError
+
+        client = self._make_client()
         contents: list = list(images) + [f"{system_prompt}\n\n{user_prompt}"]
         for attempt in range(3):
             try:
@@ -227,7 +252,13 @@ class GoogleBackend(LLMBackend):
                     model=self.model,
                     contents=contents,
                     config=genai.types.GenerateContentConfig(
-                        temperature=self.temperature
+                        temperature=self.temperature,
+                        media_resolution=genai.types.MediaResolution.MEDIA_RESOLUTION_HIGH,
+                        # Thinking tokens share the same budget as the visible
+                        # response — verbose structured asks (e.g. points+bbox+
+                        # polygon per instance) can otherwise get silently cut
+                        # off mid-JSON once thinking eats most of a small default.
+                        max_output_tokens=16000,
                     ),
                 )
                 return response.text
@@ -238,6 +269,111 @@ class GoogleBackend(LLMBackend):
                     time.sleep(wait)
                 else:
                     raise
+
+
+class AntigravityBackend(LLMBackend):
+    """Antigravity CLI backend.
+
+    Uses the local ``agy`` command in headless print mode. This is intentionally
+    a VLM/evaluator backend, not a SAM3 backend: it returns text/JSON point
+    prompts or critiques, while SAM3 performs the mask prediction.
+    """
+
+    # `agy models` lists only Gemini 3.x variants — same grounding convention
+    # (0-1000 normalized coordinates) as GoogleBackend.
+    native_point_scale = "normalized_1000"
+
+    def __init__(
+        self,
+        model: str | None = None,
+        timeout: str = "5m",
+        dangerously_skip_permissions: bool = True,
+        **_kwargs,
+    ):
+        self.model = model or "agy-default"
+        self.timeout = timeout
+        self.dangerously_skip_permissions = dangerously_skip_permissions
+
+    def chat_with_images(
+        self, system_prompt: str, user_prompt: str, images: list[Image.Image]
+    ) -> str:
+        import tempfile
+        from pathlib import Path
+
+        agy_bin = shutil.which("agy")
+        if agy_bin is None:
+            raise RuntimeError("Antigravity CLI not found on PATH: expected `agy`.")
+
+        with tempfile.TemporaryDirectory(prefix="ask-to-mask-agy-") as tmp:
+            tmp_dir = Path(tmp)
+            image_lines = []
+            for i, image in enumerate(images):
+                image_path = tmp_dir / f"image_{i}.png"
+                image.save(image_path, format="PNG")
+                image_lines.append(f"- image_{i}: {image_path.name}")
+
+            prompt = "\n\n".join(
+                [
+                    "You are being called by ask-to-mask as a vision backend.",
+                    "Do not modify any files.",
+                    "Inspect these image files in the attached workspace directory:",
+                    "\n".join(image_lines),
+                    "System prompt:",
+                    system_prompt,
+                    "User prompt:",
+                    user_prompt,
+                    "Return only the requested response. If JSON is requested, return only JSON.",
+                ]
+            )
+
+            cmd = [
+                agy_bin,
+                "--add-dir",
+                str(tmp_dir),
+                "--print",
+                prompt,
+                "--print-timeout",
+                self.timeout,
+            ]
+            if self.model and self.model != "agy-default":
+                cmd.extend(["--model", self.model])
+            if self.dangerously_skip_permissions:
+                cmd.insert(1, "--dangerously-skip-permissions")
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=_parse_duration_seconds(self.timeout) + 30,
+            )
+            if result.returncode != 0:
+                stderr = result.stderr.strip()
+                stdout = result.stdout.strip()
+                raise RuntimeError(
+                    "Antigravity CLI failed"
+                    + (f": {stderr[-1000:]}" if stderr else "")
+                    + (f"\nstdout: {stdout[-1000:]}" if stdout else "")
+                )
+            return result.stdout.strip()
+
+
+def _parse_duration_seconds(duration: str) -> int:
+    """Parse simple agy durations such as 30s, 5m, or 1h."""
+    duration = duration.strip()
+    if not duration:
+        return 300
+    unit = duration[-1]
+    try:
+        value = int(duration[:-1] if unit.isalpha() else duration)
+    except ValueError:
+        return 300
+    if unit == "s" or not unit.isalpha():
+        return value
+    if unit == "m":
+        return value * 60
+    if unit == "h":
+        return value * 3600
+    return value
 
 
 class OpenAIBackend(LLMBackend):
@@ -401,13 +537,15 @@ def create_llm_backend(provider: str, **kwargs) -> LLMBackend:
     """Factory function for LLM/VLM backends.
 
     Args:
-        provider: One of "ollama", "anthropic", "google", "openai", "huggingface".
+        provider: One of "ollama", "anthropic", "google", "antigravity",
+            "openai", "huggingface".
         **kwargs: Provider-specific arguments (model, api_key, host, etc.).
     """
     backends = {
         "ollama": OllamaBackend,
         "anthropic": AnthropicBackend,
         "google": GoogleBackend,
+        "antigravity": AntigravityBackend,
         "openai": OpenAIBackend,
         "huggingface": HuggingFaceBackend,
     }
@@ -417,7 +555,7 @@ def create_llm_backend(provider: str, **kwargs) -> LLMBackend:
             f"Available: {list(backends.keys())}"
         )
     # Strip kwargs not accepted by non-Google backends
-    if provider != "google":
+    if provider not in ("google", "antigravity"):
         for key in ("gcp_project", "gcp_location", "vertex_ai"):
             kwargs.pop(key, None)
     # Strip kwargs not accepted by HuggingFace backend

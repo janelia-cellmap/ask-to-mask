@@ -47,6 +47,7 @@ def run_zstack_refinement(
     point_backend: LLMBackend | None = None,
     point_model: str = "",
     point_prompt: str | None = None,
+    point_shape_mode: str = "points",
     z_start: int = 0,
     validate_points: bool = False,
     pre_detected_points: dict[int, list[dict]] | None = None,
@@ -65,7 +66,12 @@ def run_zstack_refinement(
     if multi_slice_points and is_sam3 and per_slice_points is None:
         pb = point_backend or llm_backend
         pm = point_model or llm_model
-        evaluator = EvaluatorAgent(pb, llm_model=pm, point_prompt=point_prompt)
+        evaluator = EvaluatorAgent(
+            pb,
+            llm_model=pm,
+            point_prompt=point_prompt,
+            point_shape_mode=point_shape_mode,
+        )
         per_slice_points = evaluator.generate_points_per_slice(
             slices, organelle, sample_count=point_sample,
         )
@@ -102,6 +108,8 @@ def run_zstack_refinement(
         z_start=z_start,
         point_backend=point_backend,
         point_model=point_model,
+        point_prompt=point_prompt,
+        point_shape_mode=point_shape_mode,
         validate_points=validate_points,
     )
 
@@ -123,6 +131,8 @@ def _run_per_slice(
     z_start: int,
     point_backend: LLMBackend | None = None,
     point_model: str = "",
+    point_prompt: str | None = None,
+    point_shape_mode: str = "points",
     validate_points: bool = False,
 ) -> ZStackResult:
     """Mode A/C: Process each slice independently via run_refinement_loop."""
@@ -156,6 +166,8 @@ def _run_per_slice(
             llm_model=llm_model,
             point_backend=point_backend,
             point_model=point_model,
+            point_prompt=point_prompt,
+            point_shape_mode=point_shape_mode,
             validate_points=validate_points,
         )
 
@@ -311,7 +323,7 @@ def _draw_points_on_image(
     points: list[dict],
     radius: int = 5,
 ) -> Image.Image:
-    """Draw colored point markers on a copy of the image.
+    """Draw colored point, box, and polygon markers on a copy of the image.
 
     Foreground points (label=1) are drawn in green, background (label=0) in red.
     """
@@ -319,16 +331,45 @@ def _draw_points_on_image(
 
     img = image.copy().convert("RGB")
     draw = ImageDraw.Draw(img)
-    for p in points:
+    drawn_regions: set[int] = set()
+    line_width = max(2, radius // 2)
+    for i, p in enumerate(points):
         x, y = p["x"], p["y"]
         label = p.get("label", 1)
         color = (0, 255, 0) if label == 1 else (255, 0, 0)
+        if label == 1:
+            inst_id = p.get("instance", i)
+            if inst_id not in drawn_regions:
+                bbox = p.get("bbox")
+                if isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
+                    draw.rectangle(
+                        [int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])],
+                        outline=color,
+                        width=line_width,
+                    )
+                polygon = _polygon_xy(p.get("polygon"))
+                if polygon:
+                    draw.line(polygon + [polygon[0]], fill=color, width=line_width)
+                drawn_regions.add(inst_id)
         draw.ellipse(
             [x - radius, y - radius, x + radius, y + radius],
             fill=color,
             outline=(255, 255, 255),
         )
     return img
+
+
+def _polygon_xy(polygon: object) -> list[tuple[int, int]] | None:
+    """Return drawable polygon coordinates if present."""
+    if not isinstance(polygon, list):
+        return None
+    pts: list[tuple[int, int]] = []
+    for p in polygon:
+        if isinstance(p, dict) and "x" in p and "y" in p:
+            pts.append((int(p["x"]), int(p["y"])))
+        elif isinstance(p, (list, tuple)) and len(p) >= 2:
+            pts.append((int(p[0]), int(p[1])))
+    return pts if len(pts) >= 3 else None
 
 
 def _overlay_mask_on_image(
@@ -356,6 +397,7 @@ def _parallel_molmo_detection(
     point_backend: LLMBackend,
     point_model: str,
     point_prompt: str | None,
+    point_shape_mode: str,
     point_sample: int | None,
 ) -> dict[str, dict[int, list[dict]]]:
     """Run Molmo point detection for all 3 planes in parallel.
@@ -371,7 +413,10 @@ def _parallel_molmo_detection(
             return plane, {}
         print(f"  [parallel] Starting Molmo detection for {plane.upper()} ({len(slices_list)} slices)")
         evaluator = EvaluatorAgent(
-            point_backend, llm_model=point_model, point_prompt=point_prompt
+            point_backend,
+            llm_model=point_model,
+            point_prompt=point_prompt,
+            point_shape_mode=point_shape_mode,
         )
         points = evaluator.generate_points_per_slice(
             slices_list, organelle, sample_count=point_sample,
@@ -413,6 +458,7 @@ def run_ortho_zstack_refinement(
     point_backend: LLMBackend | None = None,
     point_model: str = "",
     point_prompt: str | None = None,
+    point_shape_mode: str = "points",
     z_start: int = 0,
     validate_points: bool = False,
     voxel_size: tuple[float, ...] | None = None,
@@ -447,6 +493,7 @@ def run_ortho_zstack_refinement(
             point_backend=point_backend,
             point_model=point_model,
             point_prompt=point_prompt,
+            point_shape_mode=point_shape_mode,
             point_sample=point_sample,
         )
 
@@ -491,6 +538,7 @@ def run_ortho_zstack_refinement(
             point_backend=point_backend,
             point_model=point_model,
             point_prompt=point_prompt,
+            point_shape_mode=point_shape_mode,
             z_start=z_start if plane == "xy" else 0,
             validate_points=validate_points,
             pre_detected_points=pre_detected_points.get(plane),
