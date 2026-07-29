@@ -220,7 +220,7 @@ pixi run segment refine --input image.png --output-dir ./refined/ --organelle mi
   --num-steps 40 --guidance-scale 1.0 --true-cfg-scale 4.0
 ```
 
-Each iteration saves `colored.png`, `mask.png`, and `evaluation.json` to `iteration_00/`, `iteration_01/`, etc. The loop stops when the evaluator scores the mask above `--min-score` or `--max-iterations` is reached.
+Each iteration saves `colored.png`, `mask.png`, `composite.png`, `overlay.png` (the binarized mask alpha-blended onto the raw EM image, for visual QC — sparse false positives that are easy to miss against `mask.png`'s black background show up clearly here), and `evaluation.json` to `iteration_00/`, `iteration_01/`, etc. The loop stops when the evaluator scores the mask above `--min-score` or `--max-iterations` is reached.
 
 ### Architecture
 

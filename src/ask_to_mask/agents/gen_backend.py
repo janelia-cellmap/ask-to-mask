@@ -10,6 +10,23 @@ from PIL import Image
 from .schemas import GenerationParams, GenerationResult
 
 
+def _upsample_for_edit(image: Image.Image, floor: int = 1024) -> Image.Image:
+    """Upsample a crop before sending it for image-editing generation.
+
+    Small crops sent as-is can end up below a model's internal working
+    resolution, so its own uncontrolled internal resize coarsens detail before
+    it even reasons about the image. Lanczos-upsampling ourselves first caps
+    how much detail that resize can destroy. The generated result gets resized
+    back to the caller's original size regardless, so no coordinate
+    bookkeeping is needed here (unlike the point-detection upsample path).
+    """
+    w, h = image.size
+    scale = max(1.0, floor / min(w, h))
+    if scale == 1.0:
+        return image
+    return image.resize((round(w * scale), round(h * scale)), Image.LANCZOS)
+
+
 class ImageGenBackend(ABC):
     """Abstract base for image generation models.
 
@@ -140,10 +157,10 @@ class GeminiImageBackend(ImageGenBackend):
 
     def __init__(
         self,
-        model: str = "gemini-3-pro-image-preview",
+        model: str = "gemini-3-pro-image",
         api_key: str | None = None,
         gcp_project: str | None = None,
-        gcp_location: str = "us-central1",
+        gcp_location: str = "global",
         vertex_ai: bool = False,
         organelle_rgb: tuple[int, int, int] = (255, 0, 0),
         **_kwargs,
@@ -195,16 +212,17 @@ class GeminiImageBackend(ImageGenBackend):
 
         client = self._make_client()
         is_imagen = self.model.startswith("imagen")
+        send_image = _upsample_for_edit(image)
 
         for attempt in range(3):
             try:
                 if is_imagen:
                     generated_image = self._generate_imagen(
-                        client, image, params.prompt
+                        client, send_image, params.prompt
                     )
                 else:
                     generated_image = self._generate_gemini(
-                        client, image, params.prompt
+                        client, send_image, params.prompt
                     )
                 break
             except ClientError as e:

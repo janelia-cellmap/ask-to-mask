@@ -707,6 +707,15 @@ def cmd_refine(args: argparse.Namespace) -> None:
             )
         gen_backend = create_gen_backend("sam3", **sam3_kwargs)
     else:
+        gen_gcp_location = args.gcp_location
+        if (
+            args.gen_backend == "gemini"
+            and gen_gcp_location == "us-central1"
+            and not (args.model or "").startswith("imagen")
+        ):
+            # Native Gemini image models (gemini-3-pro-image, gemini-2.5-flash-image)
+            # are served at the "global" Vertex AI location, not us-central1.
+            gen_gcp_location = "global"
         gen_backend = create_gen_backend(
             args.gen_backend,
             model_key=args.model,
@@ -714,7 +723,7 @@ def cmd_refine(args: argparse.Namespace) -> None:
             device=args.device,
             organelle_rgb=organelle.rgb,
             gcp_project=args.gcp_project,
-            gcp_location=args.gcp_location,
+            gcp_location=gen_gcp_location,
             vertex_ai=args.vertex_ai,
         )
 

@@ -6,9 +6,11 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import numpy as np
 from PIL import Image
 
 from ..config import OrganelleClass
+from ..pipeline import overlay_on_raw
 from .evaluator import EvaluatorAgent
 from .gen_backend import ImageGenBackend
 from .llm_backend import LLMBackend, images_to_composite
@@ -239,7 +241,7 @@ def run_refinement_loop(
 
         # Save intermediates
         if config.save_intermediates and output_dir:
-            _save_iteration(output_dir, iteration, result, em_image)
+            _save_iteration(output_dir, iteration, result, em_image, organelle.rgb)
 
         # Step 2: Evaluate (skip if single iteration — no refinement needed)
         if config.max_iterations == 1:
@@ -612,7 +614,11 @@ def _apply_point_refinement(
 
 
 def _save_iteration(
-    output_dir: Path, iteration: int, result: GenerationResult, em_image: Image.Image
+    output_dir: Path,
+    iteration: int,
+    result: GenerationResult,
+    em_image: Image.Image,
+    organelle_rgb: tuple[int, int, int],
 ) -> None:
     """Save intermediate images for an iteration."""
     iter_dir = output_dir / f"iteration_{iteration:02d}"
@@ -621,6 +627,24 @@ def _save_iteration(
     result.mask_image.save(iter_dir / "mask.png")
     composite = images_to_composite(em_image, result.colored_image, result.mask_image)
     composite.save(iter_dir / "composite.png")
+
+    # Overlay: the binarized mask recolored and alpha-blended onto the raw EM
+    # image, for visual QC. Built from the mask (not the raw colored_image),
+    # and resized with NEAREST if needed, so it never shows soft/anti-aliased
+    # edges that the model's own generation or an interpolated resize could
+    # introduce — those would otherwise read as rings/specks once blended over
+    # the busy raw EM texture, even though they're invisible against the
+    # colored/mask images' flat black background.
+    mask_arr = np.asarray(result.mask) > 0
+    if mask_arr.shape[:2] != (em_image.height, em_image.width):
+        mask_img = Image.fromarray((mask_arr * 255).astype(np.uint8)).resize(
+            em_image.size, Image.NEAREST
+        )
+        mask_arr = np.asarray(mask_img) > 0
+    color_arr = np.zeros((*mask_arr.shape, 3), dtype=np.uint8)
+    color_arr[mask_arr] = organelle_rgb
+    overlay = overlay_on_raw(em_image, Image.fromarray(color_arr, mode="RGB"))
+    overlay.save(iter_dir / "overlay.png")
 
     # Save point visualization if points were used
     points = result.params_used.extra.get("points")

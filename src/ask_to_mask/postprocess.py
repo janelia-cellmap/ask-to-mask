@@ -13,7 +13,7 @@ def extract_mask(
     output_image: Image.Image,
     target_rgb: tuple[int, int, int],
     threshold: float = 200.0,
-    cleanup: bool = True,
+    cleanup: bool = False,
 ) -> np.ndarray:
     """Extract a binary mask by finding pixels with high saturation in the target color.
 
@@ -50,8 +50,15 @@ def extract_mask(
     else:
         score = on_min
 
-    # Clip score to [0, 255] and return as continuous mask
-    mask = np.clip(score, 0, 255).astype(np.uint8)
+    # Binarize at threshold: sub-threshold color bleed (e.g. resize/compression
+    # artifacts) must not survive into the mask, or it resurfaces as visible
+    # noise once the mask is alpha-blended over the raw image elsewhere.
+    mask = np.where(score >= threshold, 255, 0).astype(np.uint8)
+
+    if cleanup:
+        selem = disk(2)
+        mask = opening(mask, selem).astype(np.uint8)
+        mask = closing(mask, selem).astype(np.uint8)
 
     return mask
 
