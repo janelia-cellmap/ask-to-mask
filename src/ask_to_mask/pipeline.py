@@ -86,7 +86,7 @@ def segment_single(
     guidance_scale: float = 3.5,
     strength: float = 0.75,
     seed: int | None = None,
-    threshold: float = 200.0,
+    threshold: float = 30.0,
     save_colored: bool = False,
     custom_prompt: str | None = None,
     instance: bool = False,

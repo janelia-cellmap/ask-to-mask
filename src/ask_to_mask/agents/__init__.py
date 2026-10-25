@@ -10,6 +10,7 @@ from .gen_backend import (
 )
 from .sam3_backend import SAM3Backend
 from .llm_backend import LLMBackend, create_llm_backend
+from .video_backend import VeoBackend, build_veo_prompt
 from .loop import LoopConfig, LoopResult, run_refinement_loop
 from .zstack import ZStackResult, run_zstack_refinement
 from .schemas import (
@@ -29,6 +30,8 @@ __all__ = [
     "create_gen_backend",
     "LLMBackend",
     "create_llm_backend",
+    "VeoBackend",
+    "build_veo_prompt",
     "LoopConfig",
     "LoopResult",
     "run_refinement_loop",

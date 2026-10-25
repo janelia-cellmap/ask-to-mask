@@ -5,8 +5,9 @@ build-backend = "hatchling.build"
 [project]
 name = "ask-to-mask"
 version = "0.1.0"
-description = "Generate organelle segmentation masks from EM images using Flux image editing"
+description = "Organelle segmentation for electron microscopy with vision-language models and SAM3"
 license = { text = "BSD-3-Clause" }
+keywords = ["electron-microscopy", "organelle-segmentation", "vision-language-models", "segment-anything", "bioimage-analysis"]
 requires-python = ">=3.12"
 dependencies = [
     "diffusers>=0.32.0",
@@ -21,6 +22,7 @@ dependencies = [
     "funlib.geometry",
     "funlib.persistence",
     "pyyaml",
+    "imageio",
 ]
 
 [project.optional-dependencies]
@@ -36,7 +38,7 @@ agents = [
 ]
 agents-anthropic = [
     "ollama>=0.4.0",
-    "anthropic>=0.40.0",
+    "anthropic>=2.3.0",
 ]
 agents-google = [
     "ollama>=0.4.0",

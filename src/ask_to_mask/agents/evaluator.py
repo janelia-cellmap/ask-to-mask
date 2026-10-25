@@ -942,7 +942,7 @@ class EvaluatorAgent:
                     "Run: pixi install -e molmo && pixi run -e molmo install-torch-cu126"
                 )
 
-            model_name = getattr(self.backend, "model_name", "allenai/Molmo2-8B")
+            model_name = getattr(self.point_backend, "model_name", "allenai/Molmo2-8B")
 
             result = subprocess.run(
                 [

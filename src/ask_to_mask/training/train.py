@@ -507,6 +507,11 @@ def train(config_path: str, resume_from: str | None = None):
     from peft import LoraConfig, get_peft_model_state_dict
 
     config = load_config(config_path)
+    if resume_from is not None:
+        logger.warning(
+            "--resume is not implemented for LoRA training; ignoring %s and "
+            "starting a fresh run.", resume_from,
+        )
 
     model_cfg = config["model"]
     data_cfg = config["data"]

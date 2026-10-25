@@ -2,7 +2,7 @@
 
 ## Project overview
 
-Python tool that generates organelle segmentation masks from EM images using VLMs and SAM3. Supports multiple backends (Flux, SAM3, Gemini, Qwen), agentic refinement, zarr I/O, and orthogonal plane majority-vote merging. Uses pixi for environment management.
+Python tool that generates organelle segmentation masks from EM images using VLMs and SAM3. Supports multiple generation backends (Flux, SAM3, Gemini, GLM, Qwen) and VLM providers (Google, Antigravity `agy` CLI, Anthropic, OpenAI, ollama, HuggingFace/Molmo), agentic refinement, zarr I/O, orthogonal plane majority-vote merging, and zarr crop-to-video. Also contains Flux LoRA finetuning and a supervised 2.5D mitochondria model under `training/`. Uses pixi for environment management.
 
 ## Build and run
 
@@ -21,17 +21,22 @@ pixi run -e molmo install-torch-cu126
 
 - `src/ask_to_mask/config.py` — Organelle class definitions (name, color, RGB, prompt template) and model registry
 - `src/ask_to_mask/model.py` — Loads Flux pipelines via HuggingFace diffusers (supports Kontext Dev and Flux 2 Dev)
-- `src/ask_to_mask/postprocess.py` — Extracts binary masks from color difference between input/output images
+- `src/ask_to_mask/postprocess.py` — Extracts binary masks by thresholding target-color dominance in the generated image, plus instance/direct/invert variants
 - `src/ask_to_mask/pipeline.py` — Orchestrates the full flow: load image → resize → infer → extract mask → save
-- `src/ask_to_mask/cli.py` — argparse CLI with `segment`, `refine`, `train`, and `list-organelles` subcommands
+- `src/ask_to_mask/cli.py` — argparse CLI with `segment`, `refine`, `video`, `list-organelles`, `train`, `preview-train`, `train-mito-2p5d`, and `pretrain-mito-2p5d` subcommands
 - `src/ask_to_mask/agents/gen_backend.py` — Pluggable image generation backends (Flux, Gemini, GLM, Qwen, SAM3)
-- `src/ask_to_mask/zarr_io.py` — Zarr I/O: load slices/z-stacks/orthogonal planes from zarr volumes, save OME-NGFF zarr
+- `src/ask_to_mask/agents/llm_backend.py` — Pluggable LLM/VLM backends (ollama, Anthropic, Google, Antigravity, OpenAI, HuggingFace) for evaluation and point detection
+- `src/ask_to_mask/zarr_io.py` — Zarr I/O: load slices/z-stacks/orthogonal planes from zarr volumes, crop by world-coord center + voxel counts (`roi_from_center`), save OME-NGFF zarr
+- `src/ask_to_mask/video_io.py` — Encode PIL frame sequences into mp4 (`frames_to_video`)
+- `src/ask_to_mask/agents/video_backend.py` — Gemini Veo backend (`VeoBackend`) for stylized, non-frame-accurate video generation from a crop
 - `src/ask_to_mask/agents/sam3_backend.py` — SAM3 segmentation backend with text, VLM-coordinate, painted-marker strategies, and video predictor for z-stacks
 - `src/ask_to_mask/agents/marker_detection.py` — Colored marker detection for SAM3 painted-marker strategy
 - `src/ask_to_mask/agents/evaluator.py` — VLM evaluator with point-based refinement for SAM3 and batch Molmo point detection (Molmo runs as subprocess in separate pixi env)
 - `scripts/molmo_points.py` — Standalone Molmo2 inference script with single and batch modes (runs in `molmo` pixi env with transformers <5)
 - `src/ask_to_mask/agents/loop.py` — Generate-evaluate-refine orchestrator (supports pre-detected points)
 - `src/ask_to_mask/agents/zstack.py` — Z-stack orchestrator: multi-slice refinement, orthogonal plane majority vote
+- `src/ask_to_mask/agents/schemas.py` — Dataclasses for structured data exchange between agents
+- `src/ask_to_mask/training/` — Flux LoRA training (`train.py`, `dataset.py`) and the 2.5D ConvNeXt-UNet mito model (`mito_2p5d_*`, `train_mito_2p5d*.py`)
 
 ## Conventions
 

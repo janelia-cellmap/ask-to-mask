@@ -170,22 +170,22 @@ Features:
   - valid mask
   - metadata caption
 
-Default config uses conservative memory settings:
+Default config (`configs/train_mito_2p5d_fixed_fov.yaml`) memory/loader settings:
 
 ```yaml
 training:
   batch_size: 1
   gradient_accumulation_steps: 8
   mixed_precision: bf16
-  num_workers: 2
+  num_workers: 10
   persistent_workers: true
-  prefetch_factor: 2
+  prefetch_factor: 4
   pin_memory: true
 ```
 
 Effective batch size is `batch_size * gradient_accumulation_steps = 8`, not 1 — easy to misread from the config alone.
 
-If `training.num_workers` is omitted from the config (unlike the default config above, which sets it explicitly), the trainer falls back to `min(len(os.sched_getaffinity(0)), 8)`, not a hardcoded `2`.
+If `training.num_workers` is omitted from the config (unlike the default config above, which sets it explicitly), the trainer falls back to `min(len(os.sched_getaffinity(0)), 8)`.
 
 Note: `data.boundary_weight` (pseudo-label confidence/erosion weighting) and `loss.boundary_weight` (boundary BCE loss weight) are unrelated settings that happen to share a key name — do not confuse them when editing configs.
 
@@ -206,7 +206,7 @@ training:
     stage2_gt_sample_prob: 0.8
 ```
 
-Implementation note: this is two separate `DataLoader`s over the same underlying pseudo/GT dataset objects (different `gt_sample_prob`), switched at the `stage1_steps` boundary — not a live-mutated sampling probability. Persistent `DataLoader` workers keep their own copy of the dataset object, so an in-place attribute change on the main-process dataset would not be visible to workers already spawned for the first loader.
+Implementation note: this is two separate `DataLoader`s (different `gt_sample_prob`), switched at the `stage1_steps` boundary — not a live-mutated sampling probability. Persistent `DataLoader` workers keep their own copy of the dataset object, so an in-place attribute change on the main-process dataset would not be visible to workers already spawned for the first loader. Stage 2 also rebuilds its pseudo/GT datasets with a distinct `seed_offset` (500,000) rather than reusing stage 1's objects, so its freshly forked workers don't replay stage 1's sampling sequence (`train_mito_2p5d.py`).
 
 ### GT-only control run
 
@@ -231,7 +231,7 @@ Motivation: `pretrained: true` gives generic edge/texture priors from natural ph
 
 Scales are filtered by **physical resolution in nm/px** (`data.min_resolution_nm`/`max_resolution_nm`), not pyramid index — pyramid depth and base resolution both vary per dataset (checked against real data: `aic_desmosome-1` has 11 levels from 8nm/px to 8192nm/px; `jrc_hela-3` has 5 levels from 4nm/px to 64nm/px; `jrc_mus-liver-zon-2` has 14 levels up to 65536nm/px), so "pyramid index 5" means a different physical scale in each and isn't a meaningful cutoff across datasets. Including every pyramid level turned out to be overkill: at the coarsest levels (thousands to tens of thousands of nm/px) each pixel already averages over a huge patch of tissue, so there's little biological structure left to learn from, and it wastes training budget on crops that don't resemble anything the downstream fine-tuning task will see. The default `max_resolution_nm: 512.0` still gives a 512px crop a ~262µm span at its coarsest included scale — several times a whole cell's diameter (cells are roughly 20-50µm) — so it comfortably covers mito-through-cell context without wandering into the blurry, low-information tissue-scale end of the pyramid. `min_resolution_nm: null` means no lower bound, so the finest available scale (typically 4-8nm/px) is always included.
 
-**Using the result**: the trainer saves `encoder.pt` (just the encoder's `state_dict`) alongside each full checkpoint. Point `model.encoder_checkpoint` in `train_mito_2p5d_fixed_fov.yaml`/`train_mito_2p5d_gt_only.yaml` at that file (`load_pretrained_encoder` in `mito_2p5d_model.py` loads it with `strict=True`, so `encoder`/`in_channels` must match between the pretraining and fine-tuning configs) instead of `pretrained: true`.
+**Using the result**: the trainer saves `encoder.pt` (just the encoder's `state_dict`) alongside each full checkpoint. Point `model.encoder_checkpoint` in `train_mito_2p5d_fixed_fov.yaml`/`train_mito_2p5d_gt_only.yaml` at that file (`load_pretrained_encoder` in `mito_2p5d_model.py` loads it with `strict=False` and then raises on any missing or unexpected key, so `encoder`/`in_channels` must match between the pretraining and fine-tuning configs) instead of `pretrained: true`.
 
 **Launch**:
 
@@ -239,7 +239,7 @@ Scales are filtered by **physical resolution in nm/px** (`data.min_resolution_nm
 pixi run pretrain-mito-2p5d --config configs/pretrain_mito_2p5d_mae.yaml
 ```
 
-**Not yet done**: no pretraining run has actually been executed (only smoke-tested with synthetic tensors and a live check that `discover_raw_em_sources` correctly enumerates real multiscale pyramids). Step throughput, how many steps are needed before the encoder is actually useful downstream (checked via linear-probe or a short fine-tune), and whether `mask_ratio: 0.6`/`mask_patch_size: 32` are good defaults for EM data specifically are all open questions for the first real run.
+**Status**: a full 20,000-step pretraining run has completed (`runs/mito-2p5d-pretrain-mae/20260708_131605/`, encoder at `best/encoder.pt`). Still open: whether that encoder actually helps downstream (linear probe or a short fine-tune with `model.encoder_checkpoint` set), and whether `mask_ratio: 0.6`/`mask_patch_size: 32` are good defaults for EM data specifically.
 
 ## Launch
 
@@ -278,13 +278,12 @@ Already present:
 
 Not yet implemented:
 
-- explicit CUDA async prefetcher
 - adaptive real batch-size tuning
 - chunk-aware crop batching
 - in-worker decoded crop cache
 - profiling-driven worker/batch selection
 
-For initial runs, first tune real `batch_size` upward until GPU memory is near target usage, then tune `num_workers` and `prefetch_factor`. If GPU utilization stays low, add a CUDA prefetch wrapper and profile zarr read latency.
+For initial runs, first tune real `batch_size` upward until GPU memory is near target usage, then tune `num_workers` and `prefetch_factor`. A CUDA-stream batch prefetcher (`training/prefetch.py`, `CudaPrefetcher`) and per-worker RNG seeding (`training/worker_seeding.py`) are already used by both trainers; if GPU utilization stays low, profile zarr read latency next.
 
 ## Fixed Issues (previously "Known Issues", found in code review)
 
@@ -334,8 +333,8 @@ And a synthetic forward/loss/metrics smoke test using ConvNeXt-tiny on random te
 
 The curriculum/comparison-masks/leakage fixes above were additionally checked with a synthetic-tensor smoke test covering `apply_stack_augment` (with and without `extra_masks`), `finalize_mito_2p5d_sample` (with and without `comparison_masks`), and `collate_mito_2p5d` (homogeneous and heterogeneous `comparison_masks` across a batch), plus a config-loading check confirming `_comparison_mask_kwargs` and `training.curriculum` resolve as expected for both `configs/train_mito_2p5d_fixed_fov.yaml` and `configs/train_mito_2p5d_gt_only.yaml`, and that both CLI entry points still show `--help` correctly.
 
-The self-supervised pretraining stage was checked with: a synthetic-tensor smoke test covering `random_patch_mask` (shape/validity, and that it correctly rejects non-`patch_size`-divisible dimensions), `ConvNeXtMaskedAutoencoder.forward` (shape round-trip on ConvNeXt-tiny), `masked_reconstruction_loss`, and — the critical integration check — that an encoder `state_dict` produced by `ConvNeXtMaskedAutoencoder` loads via `load_pretrained_encoder` into a freshly constructed `ConvNeXtMitoUNet` with matching weights (`strict=True`, no shape mismatches). Also live-verified against real data at `/nrs/cellmap/data` (not synthetic): `discover_raw_em_sources` correctly enumerates multiscale pyramids across several real datasets; `_filter_sources_by_resolution` correctly narrows those pyramids to the configured nm/px range; and a full `Mito2p5DSelfSupervisedDataset` instance, restricted to 3 real datasets with `max_resolution_nm=512`, successfully read complete `[9, 256, 256]` crops end-to-end, genuinely drawing from different scales across samples (observed both 8nm/px and 64nm/px crops in a small batch). `pretrain-mito-2p5d --help` and `scripts/train_mito_2p5d_pretrain.py --help` both work.
+The self-supervised pretraining stage was checked with: a synthetic-tensor smoke test covering `random_patch_mask` (shape/validity, and that it correctly rejects non-`patch_size`-divisible dimensions), `ConvNeXtMaskedAutoencoder.forward` (shape round-trip on ConvNeXt-tiny), `masked_reconstruction_loss`, and — the critical integration check — that an encoder `state_dict` produced by `ConvNeXtMaskedAutoencoder` loads via `load_pretrained_encoder` into a freshly constructed `ConvNeXtMitoUNet` with matching weights (no missing/unexpected keys, no shape mismatches). Also live-verified against real data at `/nrs/cellmap/data` (not synthetic): `discover_raw_em_sources` correctly enumerates multiscale pyramids across several real datasets; `_filter_sources_by_resolution` correctly narrows those pyramids to the configured nm/px range; and a full `Mito2p5DSelfSupervisedDataset` instance, restricted to 3 real datasets with `max_resolution_nm=512`, successfully read complete `[9, 256, 256]` crops end-to-end, genuinely drawing from different scales across samples (observed both 8nm/px and 64nm/px crops in a small batch). `pretrain-mito-2p5d --help` and `scripts/train_mito_2p5d_pretrain.py --help` both work.
 
-No full real-data training run (discriminative or pretraining) has been executed yet.
+Full real-data runs have since completed: supervised training to step 5000 (`runs/mito-2p5d-fixed-fov/20260707_011029/`) and pretraining to step 20000 (`runs/mito-2p5d-pretrain-mae/20260708_131605/`).
 
-All files listed under "Main Code" and this doc itself are currently **untracked** in git (only `src/ask_to_mask/cli.py` is a tracked/modified file, for the `train-mito-2p5d` subcommand). Commit this work before treating any of the above file paths as stable references.
+All files listed under "Main Code" and this doc are committed (`96c5f83`).

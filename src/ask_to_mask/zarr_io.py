@@ -159,6 +159,45 @@ def load_zarr_roi(
     return np.asarray(data), roi, voxel_size
 
 
+def roi_from_center(
+    zarr_path: str,
+    dataset_path: str | None,
+    center_nm: tuple[float, float, float],
+    xy_voxels: int,
+    z_voxels: int,
+    y_voxels: int | None = None,
+    x_voxels: int | None = None,
+) -> Roi:
+    """Build a world-coordinate ROI centered at a point, sized in voxels.
+
+    Reads the dataset's own voxel_size (nm/voxel) so callers can specify a
+    crop purely in "how many voxels" terms without hand-computing nm extents.
+
+    Args:
+        center_nm: (z, y, x) center point in world coordinates (nm).
+        xy_voxels: Extent of the Y and X axes, in voxels (square crop).
+            Ignored per-axis if ``y_voxels``/``x_voxels`` are given.
+        z_voxels: Extent of the Z axis, in voxels.
+        y_voxels: Extent of the Y axis, in voxels. Overrides ``xy_voxels``
+            for a non-square (e.g. 16:9) crop.
+        x_voxels: Extent of the X axis, in voxels. Overrides ``xy_voxels``
+            for a non-square (e.g. 16:9) crop.
+
+    Returns:
+        A ``Roi`` in world coordinates (nm). Not yet snapped to the voxel
+        grid — ``load_zarr_roi``/``load_zarr_zstack`` do that.
+    """
+    ds = open_volume(zarr_path, dataset_path)
+    voxel_size = ds.voxel_size
+    shape_voxels = Coordinate(
+        z_voxels, y_voxels if y_voxels is not None else xy_voxels,
+        x_voxels if x_voxels is not None else xy_voxels,
+    )
+    shape_nm = shape_voxels * voxel_size
+    offset_nm = Coordinate(center_nm) - shape_nm / 2
+    return Roi(offset_nm, shape_nm)
+
+
 def load_zarr_zstack(
     zarr_path: str,
     dataset_path: str | None = None,

@@ -12,7 +12,7 @@ def extract_mask(
     input_image: Image.Image,
     output_image: Image.Image,
     target_rgb: tuple[int, int, int],
-    threshold: float = 200.0,
+    threshold: float = 30.0,
     cleanup: bool = False,
 ) -> np.ndarray:
     """Extract a binary mask by finding pixels with high saturation in the target color.
@@ -25,7 +25,8 @@ def extract_mask(
         input_image: Original EM image (RGB).
         output_image: Flux-edited image with colored organelles (RGB).
         target_rgb: The color used to highlight the organelle, e.g. (255, 0, 0).
-        threshold: Minimum value in the target channel(s) to count as colored (0-255).
+        threshold: Minimum target-color dominance score (on-channel min minus
+            off-channel max, 0-255) for a pixel to count as colored.
         cleanup: Apply morphological opening/closing to remove noise.
 
     Returns:

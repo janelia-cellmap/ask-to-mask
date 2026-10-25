@@ -147,14 +147,20 @@ class OllamaBackend(LLMBackend):
 class AnthropicBackend(LLMBackend):
     """Anthropic API (Claude)."""
 
+    # Models that accept server-side refusal fallback (`fallbacks="default"`).
+    _SERVER_FALLBACK_PREFIXES = ("claude-fable-5", "claude-opus-5", "claude-sonnet-5-5")
+
     def __init__(
         self,
-        model: str = "claude-sonnet-4-20250514",
+        model: str = "claude-sonnet-5-5",
         api_key: str | None = None,
         temperature: float = 0.3,
     ):
         self.model = model
         self.api_key = api_key
+        # Accepted for parity with the other backends but never sent: current
+        # Claude models reject non-default sampling parameters, and anthropic>=2.0
+        # (API version 2026-10-21) removed them from Messages requests entirely.
         self.temperature = temperature
 
     def chat_with_images(
@@ -178,14 +184,22 @@ class AnthropicBackend(LLMBackend):
         content.append({"type": "text", "text": user_prompt})
 
         client = anthropic.Anthropic(api_key=self.api_key) if self.api_key else anthropic.Anthropic()
-        response = client.messages.create(
+        request = dict(
             model=self.model,
-            max_tokens=1024,
+            # Headroom for adaptive thinking, which is on by default on current models
+            max_tokens=16000,
             system=system_prompt,
             messages=[{"role": "user", "content": content}],
-            temperature=self.temperature,
         )
-        return response.content[0].text
+        if self.model.startswith(self._SERVER_FALLBACK_PREFIXES):
+            # Re-run safety-classifier declines on Anthropic's recommended model
+            request.update(betas=["server-side-fallback-2026-07-01"], fallbacks="default")
+        response = client.beta.messages.create(**request)
+        if response.stop_reason == "refusal":
+            category = response.stop_details.category if response.stop_details else None
+            raise RuntimeError(f"Claude declined the request (refusal category: {category}).")
+        # content[0] may be a thinking block, so collect only the text blocks
+        return "".join(block.text for block in response.content if block.type == "text")
 
 
 class GoogleBackend(LLMBackend):

@@ -1,7 +1,7 @@
 [project]
 name = "ask-to-mask"
 version = "0.1.0"
-description = "Generate organelle segmentation masks from EM images using Flux image editing"
+description = "Organelle segmentation for electron microscopy with vision-language models and SAM3"
 channels = ["conda-forge", "pytorch", "nvidia"]
 platforms = ["linux-64"]
 

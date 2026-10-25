@@ -74,10 +74,23 @@ def _merge_config_with_args(
     return args
 
 
+def _image_gen_gcp_location(backend: str, args: argparse.Namespace) -> str:
+    """Vertex AI location for an image-generation backend."""
+    if (
+        backend == "gemini"
+        and args.gcp_location == "us-central1"
+        and not (args.model or "").startswith("imagen")
+    ):
+        # Native Gemini image models (gemini-3-pro-image, gemini-2.5-flash-image)
+        # are served at the "global" Vertex AI location, not us-central1.
+        return "global"
+    return args.gcp_location
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="ask-to-mask",
-        description="Generate organelle segmentation masks from EM images using Flux.",
+        description="Generate organelle segmentation masks from EM images using VLMs and SAM3.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -117,7 +130,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--save-zarr",
         type=str,
         default=None,
-        help="Path to save 3D mask stack as zarr (only with --zarr-path and z-count > 1).",
+        help="Path to save the 3D mask stack as zarr, one group per organelle (only with --zarr-path).",
     )
 
     seg.add_argument(
@@ -448,7 +461,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ref.add_argument(
         "--sam3-model",
         default="facebook/sam3",
-        help="SAM3 HuggingFace model ID (default: facebook/sam3).",
+        help="SAM3 weights: 'facebook/sam3' (default) downloads from HuggingFace; any other value is a local checkpoint path.",
     )
     ref.add_argument(
         "--sam3-confidence",
@@ -462,6 +475,71 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=["flux", "gemini", "glm", "qwen"],
         help="Gen backend for painting markers (only for --sam3-strategy painted-marker).",
     )
+
+    # --- video ---
+    vid = sub.add_parser(
+        "video",
+        help="Crop a zarr volume into a real video, and optionally a stylized Gemini Veo video.",
+    )
+    vid.add_argument("--config", type=Path, default=None, help="YAML config file (CLI flags override config values).")
+    vid.add_argument("--zarr-path", type=str, default=None, help="Path to a zarr volume or group.")
+    vid.add_argument(
+        "--dataset-path", type=str, default=None,
+        help="Sub-path within the zarr (e.g., 's0'). Omit if --zarr-path points directly to the array.",
+    )
+    vid.add_argument(
+        "--roi", type=str, default=None,
+        help="Explicit ROI in world coordinates (nm), e.g. '[500:1000,500:1000,1000:11000]'. "
+        "Overrides --center/--xy-voxels/--z-voxels.",
+    )
+    vid.add_argument(
+        "--center", type=str, default=None,
+        help="Crop center in world coordinates (nm), as 'z,y,x'. Used with --xy-voxels/--z-voxels.",
+    )
+    vid.add_argument("--xy-voxels", type=int, default=512, help="Crop extent in Y and X, in voxels (default: 512, square crop).")
+    vid.add_argument("--y-voxels", type=int, default=None, help="Crop extent in Y, in voxels. Overrides --xy-voxels for a non-square (e.g. 16:9) crop.")
+    vid.add_argument("--x-voxels", type=int, default=None, help="Crop extent in X, in voxels. Overrides --xy-voxels for a non-square (e.g. 16:9) crop.")
+    vid.add_argument("--z-voxels", type=int, default=60, help="Crop extent in Z, in voxels (default: 60).")
+    vid.add_argument(
+        "--z-step-nm", type=float, default=None,
+        help="Z spacing in nm to subsample slices within the crop. Default: every voxel.",
+    )
+    vid.add_argument(
+        "--duration-seconds", type=float, default=5.0,
+        help="Target length in seconds for the raw-input video (default: 5.0).",
+    )
+    vid.add_argument(
+        "--upsample", type=float, default=1.0,
+        help="Lanczos-upsample each frame by this factor before encoding, to "
+        "pre-compensate for downstream downsampling (default: 1.0, no upsampling).",
+    )
+    vid.add_argument(
+        "--organelle", default=None, choices=list(ORGANELLES.keys()),
+        help="Organelle class, used to build the default Veo prompt.",
+    )
+    vid.add_argument("--output-dir", type=Path, default=None, help="Directory to save the crop/video outputs.")
+    vid.add_argument(
+        "--generate-veo", action="store_true",
+        help="Also generate a stylized (non-frame-accurate) Veo video from the crop.",
+    )
+    vid.add_argument("--veo-model", default="veo-3.1-fast-generate-001", help="Veo model name.")
+    vid.add_argument(
+        "--veo-output-gcs-uri", default=None,
+        help="GCS URI prefix for Veo's output (required by Vertex AI), e.g. gs://my-bucket/veo-out/.",
+    )
+    vid.add_argument("--veo-prompt", default=None, help="Custom Veo prompt (default: built from --organelle).")
+    vid.add_argument(
+        "--veo-duration-seconds", type=float, default=None,
+        help="Veo clip length in seconds (snapped to Veo's nearest supported value: 4, 6, or 8). "
+        "Default: same as --duration-seconds.",
+    )
+    vid.add_argument("--veo-aspect-ratio", default="16:9", help="Veo output aspect ratio (default: 16:9).")
+    vid.add_argument(
+        "--veo-reference-frame", default="middle", choices=["first", "middle", "last", "none"],
+        help="Which crop slice to send to Veo as first-frame conditioning (default: middle).",
+    )
+    vid.add_argument("--gcp-project", default=None, help="GCP project ID for Vertex AI.")
+    vid.add_argument("--gcp-location", default="global", help="GCP location for Vertex AI (default: global).")
 
     # --- list-organelles ---
     sub.add_parser("list-organelles", help="List available organelle classes.")
@@ -533,7 +611,9 @@ def cmd_segment(args: argparse.Namespace) -> None:
             z_indices = list(range(args.z_start, args.z_start + args.z_count * args.z_step, args.z_step))
         print(f"Processing {len(slices)} slice(s) for organelles: {args.organelles}")
 
-        all_masks = []  # for zarr output: list of (Z, H, W) per organelle
+        from PIL import Image
+
+        all_masks = {key: [] for key in args.organelles}  # organelle -> per-slice (H, W) masks
         for i, (sl, z_idx) in enumerate(zip(slices, z_indices)):
             stem = f"z{z_idx:04d}"
             print(f"\n--- slice {z_idx} ({i+1}/{len(slices)}) ---")
@@ -541,14 +621,20 @@ def cmd_segment(args: argparse.Namespace) -> None:
                 pipe, None, args.organelles, args.output_dir,
                 image=sl, image_stem=stem, **kwargs,
             )
-            for m in masks:
+            for key, m in zip(args.organelles, masks):
                 print(f"  Saved: {m}")
+                if args.save_zarr:
+                    all_masks[key].append(np.array(Image.open(m)))
 
-        if args.save_zarr and args.z_count > 1:
-            # Collect masks per organelle and save as zarr
-            from .pipeline import segment_single, load_em_image
-            print(f"\nNote: --save-zarr writes masks from the per-slice PNGs above.")
-            print(f"  Zarr output: {args.save_zarr}")
+        if args.save_zarr:
+            # One multiscale group per organelle, e.g. stack.zarr/mito/s0
+            for key, stack in all_masks.items():
+                save_masks_to_zarr(
+                    np.stack(stack), args.save_zarr, dataset_name=key,
+                    voxel_size=info.get("voxel_size"),
+                    offset=tuple(roi.offset) if roi else None,
+                )
+            print(f"\n  Zarr output: {args.save_zarr} ({', '.join(f'{k}/s0' for k in all_masks)})")
 
         print("\nDone.")
     else:
@@ -702,20 +788,11 @@ def cmd_refine(args: argparse.Namespace) -> None:
                 device=args.device,
                 organelle_rgb=organelle.rgb,
                 gcp_project=args.gcp_project,
-                gcp_location=args.gcp_location,
+                gcp_location=_image_gen_gcp_location(args.marker_backend, args),
                 vertex_ai=args.vertex_ai,
             )
         gen_backend = create_gen_backend("sam3", **sam3_kwargs)
     else:
-        gen_gcp_location = args.gcp_location
-        if (
-            args.gen_backend == "gemini"
-            and gen_gcp_location == "us-central1"
-            and not (args.model or "").startswith("imagen")
-        ):
-            # Native Gemini image models (gemini-3-pro-image, gemini-2.5-flash-image)
-            # are served at the "global" Vertex AI location, not us-central1.
-            gen_gcp_location = "global"
         gen_backend = create_gen_backend(
             args.gen_backend,
             model_key=args.model,
@@ -723,7 +800,7 @@ def cmd_refine(args: argparse.Namespace) -> None:
             device=args.device,
             organelle_rgb=organelle.rgb,
             gcp_project=args.gcp_project,
-            gcp_location=gen_gcp_location,
+            gcp_location=_image_gen_gcp_location(args.gen_backend, args),
             vertex_ai=args.vertex_ai,
         )
 
@@ -1026,6 +1103,100 @@ def cmd_refine(args: argparse.Namespace) -> None:
 
 
 
+def cmd_video(args: argparse.Namespace) -> None:
+    # Merge YAML config if provided
+    if args.config:
+        config = _load_yaml_config(args.config)
+        args = _merge_config_with_args(args, config)
+
+    if not args.zarr_path:
+        raise SystemExit("Error: --zarr-path is required (or set in --config)")
+    if not args.roi and not args.center:
+        raise SystemExit("Error: one of --roi or --center is required (or set in --config)")
+    if not args.output_dir:
+        raise SystemExit("Error: --output-dir is required (or set in --config)")
+    args.output_dir = Path(args.output_dir) if isinstance(args.output_dir, str) else args.output_dir
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    from .zarr_io import get_zarr_info, load_zarr_zstack, parse_roi, roi_from_center
+    from .video_io import frames_to_video
+
+    info = get_zarr_info(args.zarr_path, args.dataset_path)
+    print(f"Zarr volume: {args.zarr_path} {info}")
+
+    if args.roi:
+        roi = parse_roi(args.roi)
+    else:
+        center_nm = tuple(float(v) for v in args.center.split(","))
+        roi = roi_from_center(
+            args.zarr_path, args.dataset_path, center_nm,
+            xy_voxels=args.xy_voxels, z_voxels=args.z_voxels,
+            y_voxels=args.y_voxels, x_voxels=args.x_voxels,
+        )
+    print(f"  ROI (nm): {roi}")
+
+    slices = load_zarr_zstack(
+        args.zarr_path, args.dataset_path, roi=roi, z_step_nm=args.z_step_nm,
+    )
+    print(f"Loaded {len(slices)} slice(s) for the crop.")
+
+    raw_video_path = frames_to_video(
+        slices, args.output_dir / "raw_input.mp4", duration_seconds=args.duration_seconds,
+        upsample_factor=getattr(args, "upsample", 1.0),
+    )
+
+    _save_run_metadata(args, args.output_dir)
+
+    if not args.generate_veo:
+        print(f"\nDone. Raw input video: {raw_video_path}")
+        return
+
+    from .agents import VeoBackend, build_veo_prompt
+
+    if not args.veo_output_gcs_uri:
+        raise SystemExit(
+            "Error: --veo-output-gcs-uri is required with --generate-veo "
+            "(Vertex AI Veo writes its output to GCS)."
+        )
+
+    if args.veo_prompt:
+        prompt = args.veo_prompt
+    elif args.organelle:
+        organelle = ORGANELLES[args.organelle]
+        prompt = build_veo_prompt(organelle.name, organelle.color_name, resolution_nm=info.get("voxel_size", [None])[-1])
+    else:
+        raise SystemExit("Error: --generate-veo requires --organelle or an explicit --veo-prompt.")
+
+    reference_image = None
+    if args.veo_reference_frame != "none":
+        idx = {"first": 0, "middle": len(slices) // 2, "last": len(slices) - 1}[args.veo_reference_frame]
+        reference_image = slices[idx]
+
+    veo = VeoBackend(
+        model=args.veo_model,
+        gcp_project=args.gcp_project,
+        gcp_location=args.gcp_location,
+        output_gcs_uri=args.veo_output_gcs_uri,
+    )
+    veo_duration = args.veo_duration_seconds if args.veo_duration_seconds is not None else args.duration_seconds
+
+    print(f"\nRequesting Veo video ({args.veo_model})...")
+    print(f'  Prompt: "{prompt}"')
+    (args.output_dir / "veo_prompt.txt").write_text(prompt + "\n")
+
+    gcs_uri = veo.generate(
+        prompt=prompt,
+        reference_image=reference_image,
+        duration_seconds=veo_duration,
+        aspect_ratio=args.veo_aspect_ratio,
+    )
+    print(f"  Veo video: {gcs_uri}")
+    (args.output_dir / "veo_video_uri.txt").write_text(gcs_uri + "\n")
+    veo.download(gcs_uri, args.output_dir / "veo_video.mp4")
+
+    print(f"\nDone. Raw input video: {raw_video_path}")
+
+
 def cmd_train(args: argparse.Namespace) -> None:
     from .training.train import train
 
@@ -1079,6 +1250,8 @@ def main(argv: list[str] | None = None) -> None:
         cmd_segment(args)
     elif args.command == "refine":
         cmd_refine(args)
+    elif args.command == "video":
+        cmd_video(args)
     elif args.command == "train":
         cmd_train(args)
     elif args.command == "train-mito-2p5d":

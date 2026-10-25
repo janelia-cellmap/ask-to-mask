@@ -612,7 +612,7 @@ packages:
 - pypi: .
   name: ask-to-mask
   version: 0.1.0
-  sha256: 38f86298a168a121c16edc270d48159e29ac404fbd7ff419069880ed7e66c55c
+  sha256: e054e05f1c4833852bb95355a6019565f7fea28db434c97d61d8f5870fe57946
   requires_dist:
   - diffusers>=0.32.0
   - transformers
@@ -626,6 +626,7 @@ packages:
   - funlib-geometry
   - funlib-persistence
   - pyyaml
+  - imageio
   - peft>=0.7.0 ; extra == 'train'
   - scipy ; extra == 'train'
   - tensorboard ; extra == 'train'

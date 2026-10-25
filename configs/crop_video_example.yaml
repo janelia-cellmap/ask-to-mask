@@ -1,0 +1,37 @@
+# Example config for the 'video' command: crop a zarr volume into a real
+# video, and (optionally) generate a stylized Gemini Veo video from it.
+# Usage: pixi run segment video --config configs/crop_video_example.yaml
+#
+# CLI flags override any values set here.
+
+# Input
+zarr_path: /nrs/cellmap/data/jrc_mus-liver/jrc_mus-liver.zarr/recon-1/em/fibsem-uint8
+dataset_path: s0
+
+# Crop: either give an explicit --roi (world nm, "z:z,y:y,x:x"), or a center
+# point + voxel counts in xy/z (resolution/nm-per-voxel comes from the
+# dataset's own metadata — no need to specify it separately).
+center: "50000,50000,50000"  # z,y,x in nm
+xy_voxels: 512
+z_voxels: 60
+# z_step_nm: 40  # subsample Z within the crop; default is every voxel
+
+# Real input video, built directly from the crop (accurate — no AI involved)
+duration_seconds: 5.0
+output_dir: ./outputs/crop_video/
+
+# Organelle used to build the default Veo prompt
+organelle: mito
+
+# Stylized Veo video (generative — NOT frame-accurate; Veo has no
+# video-in/video-out editing mode, only text/image-conditioned generation).
+# Requires a GCS bucket you can write to (Vertex AI Veo output requirement).
+generate_veo: false
+# veo_output_gcs_uri: gs://my-bucket/veo-out/
+veo_model: veo-3.1-fast-generate-001
+veo_duration_seconds: 5.0  # snapped to Veo's nearest supported value: 4, 6, or 8
+veo_aspect_ratio: "16:9"
+veo_reference_frame: middle  # first | middle | last | none
+
+gcp_project: null  # falls back to GOOGLE_CLOUD_PROJECT env var
+gcp_location: global

@@ -2,7 +2,11 @@
 
 ## Status
 
-Not started. This is a plan, not an in-progress implementation. The current
+Not started on this branch: nothing here is implemented in this branch's code.
+A 3D implementation (`mito_3d_dataset.py`, `mito_3d_model.py`,
+`train_mito_3d.py`, `configs/train_mito_3d_fixed_fov.yaml`) and an expanded
+version of this doc live on branch `feature/mito-mask-diffusion-plan`
+(commit `100d0a8`), with a run under `runs/mito-3d-fixed-fov/`. The current
 2.5D pipeline (`docs/mito_2p5d_training_handoff.md`) is deliberately being
 kept as-is and run first; this document exists so the 3D option is scoped
 and ready to pick up once there's a reason to invest in it (see "When to
