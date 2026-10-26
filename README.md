@@ -4,6 +4,10 @@ Generate organelle segmentation masks from EM images using vision-language model
 
 Supports multiple backends — Flux image editing, SAM3 with VLM-guided point prompts (including Molmo), Gemini, and Qwen — with an agentic refinement loop that iteratively improves masks using VLM feedback. Reads directly from zarr volumes and can process orthogonal planes (XY, XZ, YZ) with majority-vote merging for robust 3D segmentation.
 
+![ask-to-mask refine iteration: input crop, generated mask, the prompt and the critique](docs/images/refine-example.jpg)
+
+*One refine iteration on a public CellMap Segmentation Challenge crop (jrc_zf-cardiac-1, crop 987). Gemini 3.5 Flash writes the prompt from the image, gemini-3-pro-image draws the mask, and Gemini 3.5 Flash critiques it. The prompt and critique are quoted from the run's evaluation.json; the 0.95 is the critic's own estimate, not a ground-truth score.*
+
 ## Setup
 
 Requires [pixi](https://pixi.sh).
